@@ -15,8 +15,8 @@ class BluetoothScannerPage extends StatefulWidget {
   State<BluetoothScannerPage> createState() => _BluetoothScannerPageState();
 }
 
-class _BluetoothScannerPageState extends State<BluetoothScannerPage>
-    with SingleTickerProviderStateMixin {
+// Quitamos SingleTickerProviderStateMixin — ya no hay AnimationController
+class _BluetoothScannerPageState extends State<BluetoothScannerPage> {
   // ─── State ───────────────────────────────────────────────────────────────
   final Map<DeviceIdentifier, ScanResult> _scanResultsMap = {};
   List<ScanResult> get _scanResults {
@@ -26,34 +26,19 @@ class _BluetoothScannerPageState extends State<BluetoothScannerPage>
   }
 
   BluetoothDevice? _connectedDevice;
-  bool _isScanning = false;
   bool _isConnecting = false;
   String? _connectingDeviceId;
   String? _permissionError;
 
   StreamSubscription<List<ScanResult>>? _scanSubscription;
-  StreamSubscription<bool>? _isScanningSubscription;
   StreamSubscription<BluetoothAdapterState>? _adapterSubscription;
   StreamSubscription<BluetoothConnectionState>? _connectionStateSubscription;
   BluetoothAdapterState _adapterState = BluetoothAdapterState.unknown;
-
-  late AnimationController _pulseController;
-  late Animation<double> _pulseAnimation;
 
   // ─── Lifecycle ───────────────────────────────────────────────────────────
   @override
   void initState() {
     super.initState();
-
-    _pulseController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 900),
-    )..repeat(reverse: true);
-
-    _pulseAnimation = Tween<double>(begin: 0.85, end: 1.0).animate(
-      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
-    );
-
     _adapterSubscription = FlutterBluePlus.adapterState.listen((state) {
       if (mounted) setState(() => _adapterState = state);
       if (state != BluetoothAdapterState.on) {
@@ -65,9 +50,7 @@ class _BluetoothScannerPageState extends State<BluetoothScannerPage>
 
   @override
   void dispose() {
-    _pulseController.dispose();
     _scanSubscription?.cancel();
-    _isScanningSubscription?.cancel();
     _adapterSubscription?.cancel();
     _connectionStateSubscription?.cancel();
     super.dispose();
@@ -110,7 +93,6 @@ class _BluetoothScannerPageState extends State<BluetoothScannerPage>
         return false;
       }
     }
-
     return true;
   }
 
@@ -121,20 +103,14 @@ class _BluetoothScannerPageState extends State<BluetoothScannerPage>
       return;
     }
 
-    // 1. Permisos en runtime — CRÍTICO para que connect() funcione en Android
     final granted = await _requestPermissions();
     if (!granted) return;
 
-    // 2. Limpiar suscripciones anteriores para no duplicarlas
+    // Cancelar suscripción anterior para no duplicar listeners
     await _scanSubscription?.cancel();
-    await _isScanningSubscription?.cancel();
+    setState(() => _scanResultsMap.clear());
 
-    setState(() {
-      _scanResultsMap.clear();
-      _isScanning = true;
-    });
-
-    // 3. Escuchar resultados (se acumulan en el Map por remoteId)
+    // Escuchar resultados — el Map evita duplicados por remoteId
     _scanSubscription = FlutterBluePlus.scanResults.listen((results) {
       if (!mounted) return;
       setState(() {
@@ -144,12 +120,9 @@ class _BluetoothScannerPageState extends State<BluetoothScannerPage>
       });
     }, onError: (e) => _showSnack('Error de escaneo: $e', isError: true));
 
-    // 4. Detectar fin automático del scan
-    _isScanningSubscription = FlutterBluePlus.isScanning.listen((scanning) {
-      if (!scanning && mounted) setState(() => _isScanning = false);
-    });
-
-    // 5. Iniciar
+    // CLAVE: el FAB usa StreamBuilder sobre FlutterBluePlus.isScanning,
+    // por lo que el botón cambia en cuanto el stream emite true/false,
+    // sin depender de ninguna variable local ni setState adicional.
     try {
       await FlutterBluePlus.startScan(
         timeout: const Duration(seconds: 15),
@@ -157,58 +130,70 @@ class _BluetoothScannerPageState extends State<BluetoothScannerPage>
       );
     } catch (e) {
       _showSnack('No se pudo iniciar el escaneo: $e', isError: true);
-      setState(() => _isScanning = false);
     }
   }
 
   Future<void> _stopScan() async {
     await FlutterBluePlus.stopScan();
-    if (mounted) setState(() => _isScanning = false);
+    // No necesitamos setState aquí — el StreamBuilder reacciona solo
   }
 
   // ─── Connection ──────────────────────────────────────────────────────────
   Future<void> _connect(BluetoothDevice device) async {
     if (_isConnecting || _connectedDevice != null) return;
 
-    // IMPORTANTE: detener el escaneo antes de conectar en Android
-    if (_isScanning) await _stopScan();
+    // Detener el escaneo antes de conectar (crítico en Android)
+    if (FlutterBluePlus.isScanningNow) await _stopScan();
+    await Future.delayed(const Duration(milliseconds: 300));
 
     setState(() {
       _isConnecting = true;
       _connectingDeviceId = device.remoteId.str;
     });
 
-    try {
-      await device.connect(
-        timeout: const Duration(seconds: 15),
-        autoConnect: false, // evita problemas de timeout en Android
-      );
+    for (int attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await device.connect(
+          timeout: const Duration(seconds: 20),
+          autoConnect: false,
+        );
 
-      // Escuchar desconexiones inesperadas
-      _connectionStateSubscription?.cancel();
-      _connectionStateSubscription = device.connectionState.listen((state) {
-        if (!mounted) return;
-        if (state == BluetoothConnectionState.disconnected) {
-          setState(() => _connectedDevice = null);
-          _showSnack('Dispositivo desconectado');
-        }
-      });
-
-      if (mounted) {
-        setState(() => _connectedDevice = device);
-        _showSnack('Conectado a ${_deviceName(device)}');
-      }
-    } on FlutterBluePlusException catch (e) {
-      _showSnack('Error al conectar: ${_friendlyError(e)}', isError: true);
-    } catch (e) {
-      _showSnack('Error inesperado: $e', isError: true);
-    } finally {
-      if (mounted) {
-        setState(() {
-          _isConnecting = false;
-          _connectingDeviceId = null;
+        // Escuchar desconexiones inesperadas
+        _connectionStateSubscription?.cancel();
+        _connectionStateSubscription = device.connectionState.listen((state) {
+          if (!mounted) return;
+          if (state == BluetoothConnectionState.disconnected) {
+            setState(() => _connectedDevice = null);
+            _showSnack('Dispositivo desconectado');
+          }
         });
+
+        if (mounted) {
+          setState(() => _connectedDevice = device);
+          _showSnack('Conectado a ${_deviceName(device)}');
+        }
+        break; // éxito — salir del loop
+      } on FlutterBluePlusException catch (e) {
+        print(e);
+        if (e.code == 147 && attempt < 3) {
+          // GATT_CONNECTION_TIMEOUT — esperar y reintentar
+          _showSnack('Reintentando conexión ($attempt/3)...', isError: false);
+          await Future.delayed(Duration(seconds: attempt * 2));
+          continue;
+        }
+        _showSnack('Error al conectar: ${_friendlyError(e)}', isError: true);
+        break;
+      } catch (e) {
+        _showSnack('Error inesperado: $e', isError: true);
+        break;
       }
+    }
+
+    if (mounted) {
+      setState(() {
+        _isConnecting = false;
+        _connectingDeviceId = null;
+      });
     }
   }
 
@@ -233,10 +218,12 @@ class _BluetoothScannerPageState extends State<BluetoothScannerPage>
 
   String _friendlyError(FlutterBluePlusException e) {
     switch (e.code) {
+      case 8:
+        return 'Timeout — acerca el dispositivo e intenta de nuevo';
       case 133:
-        return 'GATT 133 — acerca el dispositivo e intenta de nuevo';
+        return 'GATT 133 — reinicia el Bluetooth e intenta de nuevo';
       case 6:
-        return 'Conexión cancelada por el dispositivo';
+        return 'Cancelado por el dispositivo';
       default:
         return e.description ?? 'Código ${e.code}';
     }
@@ -283,7 +270,7 @@ class _BluetoothScannerPageState extends State<BluetoothScannerPage>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: _AppColors.bg,
+      backgroundColor: _AppColors.textPrimary,
       appBar: _buildAppBar(),
       body: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -294,7 +281,34 @@ class _BluetoothScannerPageState extends State<BluetoothScannerPage>
           Expanded(child: _buildBody()),
         ],
       ),
-      floatingActionButton: _buildFAB(),
+      // ── FAB con StreamBuilder ──────────────────────────────────────────
+      // Reacciona directamente al stream del stack BLE, sin variable local.
+      // Así el botón cambia instantáneamente cuando startScan/stopScan
+      // modifica el estado interno de FlutterBluePlus.
+      floatingActionButton: StreamBuilder<bool>(
+        stream: FlutterBluePlus.isScanning,
+        initialData: false,
+        builder: (context, snapshot) {
+          final isScanning = snapshot.data ?? false;
+          return FloatingActionButton.extended(
+            onPressed: isScanning ? _stopScan : _startScan,
+            backgroundColor: isScanning ? _AppColors.error : _AppColors.accent,
+            elevation: 4,
+            icon: Icon(
+              isScanning ? Icons.stop_rounded : Icons.search_rounded,
+              color: Colors.white,
+            ),
+            label: Text(
+              isScanning ? 'Detener' : 'Escanear',
+              style: const TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.w600,
+                letterSpacing: 0.3,
+              ),
+            ),
+          );
+        },
+      ),
     );
   }
 
@@ -333,12 +347,15 @@ class _BluetoothScannerPageState extends State<BluetoothScannerPage>
           ),
         ],
       ),
+      // Indicador de escaneo en el AppBar — también via StreamBuilder
       actions: [
-        if (_isScanning)
-          Padding(
-            padding: const EdgeInsets.only(right: 16),
-            child: ScaleTransition(
-              scale: _pulseAnimation,
+        StreamBuilder<bool>(
+          stream: FlutterBluePlus.isScanning,
+          initialData: false,
+          builder: (context, snapshot) {
+            if (!(snapshot.data ?? false)) return const SizedBox.shrink();
+            return Padding(
+              padding: const EdgeInsets.only(right: 16),
               child: Container(
                 padding: const EdgeInsets.symmetric(
                   horizontal: 10,
@@ -370,8 +387,9 @@ class _BluetoothScannerPageState extends State<BluetoothScannerPage>
                   ],
                 ),
               ),
-            ),
-          ),
+            );
+          },
+        ),
       ],
     );
   }
@@ -476,7 +494,35 @@ class _BluetoothScannerPageState extends State<BluetoothScannerPage>
 
   Widget _buildBody() {
     final results = _scanResults;
-    if (results.isEmpty && !_isScanning) return _buildEmptyState();
+    if (results.isEmpty) {
+      return StreamBuilder<bool>(
+        stream: FlutterBluePlus.isScanning,
+        initialData: false,
+        builder: (context, snapshot) {
+          final isScanning = snapshot.data ?? false;
+          if (isScanning) {
+            return const Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  CircularProgressIndicator(color: _AppColors.accent),
+                  SizedBox(height: 16),
+                  Text(
+                    'Buscando dispositivos...',
+                    style: TextStyle(
+                      color: _AppColors.textSecondary,
+                      fontSize: 14,
+                    ),
+                  ),
+                ],
+              ),
+            );
+          }
+          return _buildEmptyState();
+        },
+      );
+    }
+
     return ListView.builder(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 100),
       itemCount: results.length,
@@ -643,26 +689,6 @@ class _BluetoothScannerPageState extends State<BluetoothScannerPage>
       ),
     );
   }
-
-  Widget _buildFAB() {
-    return FloatingActionButton.extended(
-      onPressed: _isScanning ? _stopScan : _startScan,
-      backgroundColor: _isScanning ? _AppColors.error : _AppColors.accent,
-      elevation: 4,
-      icon: Icon(
-        _isScanning ? Icons.stop_rounded : Icons.search_rounded,
-        color: Colors.white,
-      ),
-      label: Text(
-        _isScanning ? 'Detener' : 'Escanear',
-        style: const TextStyle(
-          color: Colors.white,
-          fontWeight: FontWeight.w600,
-          letterSpacing: 0.3,
-        ),
-      ),
-    );
-  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -756,6 +782,10 @@ class _ActionChip extends StatelessWidget {
     );
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Paleta
+// ─────────────────────────────────────────────────────────────────────────────
 
 abstract class _AppColors {
   static const bg = Color(0xFF0F1117);
