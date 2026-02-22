@@ -24,14 +24,11 @@ class RfidTag {
     required this.raw,
   });
 
-  // Intenta extraer un UID legible de los bytes crudos del lector RFID.
-  // Los lectores BLE suelen enviar el UID como HEX en los primeros N bytes.
   static RfidTag fromBytes(List<int> bytes, int rssi) {
     final raw = bytes
         .map((b) => b.toRadixString(16).padLeft(2, '0'))
         .join(' ')
         .toUpperCase();
-    // UID: primeros 4–7 bytes según el protocolo del lector
     final uidBytes = bytes.length >= 4
         ? bytes.sublist(0, bytes.length >= 7 ? 7 : 4)
         : bytes;
@@ -41,6 +38,26 @@ class RfidTag {
         .toUpperCase();
     return RfidTag(uid: uid, timestamp: DateTime.now(), rssi: rssi, raw: raw);
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Modelo de log BLE
+// ─────────────────────────────────────────────────────────────────────────────
+
+class BleLogEntry {
+  final DateTime timestamp;
+  final String direction; // 'RX' o 'TX'
+  final String description;
+  final String rawHex;
+  final int byteCount;
+
+  BleLogEntry({
+    required this.timestamp,
+    required this.direction,
+    required this.description,
+    required this.rawHex,
+    required this.byteCount,
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -58,10 +75,12 @@ class RfidReaderPage extends StatefulWidget {
 class _RfidReaderPageState extends State<RfidReaderPage> {
   // ─── State ───────────────────────────────────────────────────────────────
   final List<RfidTag> _tags = [];
+  final List<BleLogEntry> _logs = [];
   final ScrollController _scrollController = ScrollController();
 
   bool _isListening = false;
   bool _isExporting = false;
+  bool _isFabExpanded = false;
   int _currentRssi = 0;
 
   BluetoothCharacteristic? _notifyCharacteristic;
@@ -85,13 +104,42 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
     super.dispose();
   }
 
+  // ─── Logging helper ──────────────────────────────────────────────────────
+  void _addLog({
+    required String direction,
+    required String description,
+    String rawHex = '',
+    int byteCount = 0,
+  }) {
+    if (!mounted) return;
+    setState(() {
+      _logs.insert(
+        0,
+        BleLogEntry(
+          timestamp: DateTime.now(),
+          direction: direction,
+          description: description,
+          rawHex: rawHex,
+          byteCount: byteCount,
+        ),
+      );
+    });
+  }
+
   // ─── BLE connection watcher ──────────────────────────────────────────────
   void _watchConnection() {
     _connectionSubscription = widget.device.connectionState.listen((state) {
       if (!mounted) return;
-      setState(
-        () => _deviceConnected = state == BluetoothConnectionState.connected,
+      final connected = state == BluetoothConnectionState.connected;
+      setState(() => _deviceConnected = connected);
+
+      _addLog(
+        direction: 'SYS',
+        description: connected
+            ? 'Conexión establecida'
+            : 'Dispositivo desconectado',
       );
+
       if (state == BluetoothConnectionState.disconnected) {
         _notifySubscription?.cancel();
         setState(() => _isListening = false);
@@ -103,12 +151,36 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
   // ─── GATT discovery ──────────────────────────────────────────────────────
   Future<void> _discoverAndListen() async {
     try {
+      _addLog(direction: 'TX', description: 'Descubriendo servicios GATT...');
       final services = await widget.device.discoverServices();
 
-      // Busca la primera característica que soporte NOTIFY o INDICATE.
-      // Los lectores RFID BLE populares (p.ej. ACM/Zebra/Chainway) suelen
-      // exponer sus datos en la característica 0xFFF1 o 0xFFE1 del servicio
-      // 0xFFF0 / 0xFFE0, pero la búsqueda genérica aquí cubre cualquier marca.
+      _addLog(
+        direction: 'RX',
+        description: '${services.length} servicios descubiertos',
+      );
+
+      // Log de todos los servicios y características encontrados
+      for (final svc in services) {
+        _addLog(
+          direction: 'RX',
+          description:
+              'Servicio: ${svc.uuid.toString().toUpperCase()}  (${svc.characteristics.length} características)',
+        );
+        for (final chr in svc.characteristics) {
+          final props = <String>[];
+          if (chr.properties.read) props.add('READ');
+          if (chr.properties.write) props.add('WRITE');
+          if (chr.properties.writeWithoutResponse) props.add('WRITE_NR');
+          if (chr.properties.notify) props.add('NOTIFY');
+          if (chr.properties.indicate) props.add('INDICATE');
+          _addLog(
+            direction: 'RX',
+            description:
+                '  └─ Char: ${chr.uuid.toString().toUpperCase()}  [${props.join(", ")}]',
+          );
+        }
+      }
+
       BluetoothCharacteristic? found;
       for (final svc in services) {
         for (final chr in svc.characteristics) {
@@ -121,6 +193,10 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
       }
 
       if (found == null) {
+        _addLog(
+          direction: 'SYS',
+          description: '⚠ No se encontró característica NOTIFY/INDICATE',
+        );
         _showSnack(
           'No se encontró característica de notificación',
           isError: true,
@@ -128,9 +204,16 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
         return;
       }
 
+      _addLog(
+        direction: 'SYS',
+        description:
+            'Característica seleccionada: ${found.uuid.toString().toUpperCase()}',
+      );
+
       _notifyCharacteristic = found;
       await _startListening();
     } catch (e) {
+      _addLog(direction: 'SYS', description: '✖ Error GATT: $e');
       _showSnack('Error al descubrir servicios: $e', isError: true);
     }
   }
@@ -139,17 +222,43 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
   Future<void> _startListening() async {
     if (_notifyCharacteristic == null) return;
     try {
+      _addLog(
+        direction: 'TX',
+        description:
+            'Activando NOTIFY en ${_notifyCharacteristic!.uuid.toString().toUpperCase()}',
+      );
+
       await _notifyCharacteristic!.setNotifyValue(true);
+
+      _addLog(direction: 'SYS', description: 'Notificaciones activadas ✓');
+
       _notifySubscription = _notifyCharacteristic!.onValueReceived.listen((
         bytes,
       ) {
         if (bytes.isEmpty || !mounted) return;
+
+        final hexStr = bytes
+            .map((b) => b.toRadixString(16).padLeft(2, '0'))
+            .join(' ')
+            .toUpperCase();
+
+        _addLog(
+          direction: 'RX',
+          description: 'Datos recibidos (${bytes.length} bytes)',
+          rawHex: hexStr,
+          byteCount: bytes.length,
+        );
+
         final tag = RfidTag.fromBytes(bytes, _currentRssi);
-        setState(() => _tags.insert(0, tag)); // más reciente arriba
+        setState(() => _tags.insert(0, tag));
         _autoScroll();
-      }, onError: (e) => _showSnack('Error de lectura: $e', isError: true));
+      }, onError: (e) {
+        _addLog(direction: 'SYS', description: '✖ Error de lectura: $e');
+        _showSnack('Error de lectura: $e', isError: true);
+      });
       if (mounted) setState(() => _isListening = true);
     } catch (e) {
+      _addLog(direction: 'SYS', description: '✖ Error al activar NOTIFY: $e');
       _showSnack('No se pudo activar notificaciones: $e', isError: true);
     }
   }
@@ -157,6 +266,7 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
   Future<void> _stopListening() async {
     try {
       await _notifyCharacteristic?.setNotifyValue(false);
+      _addLog(direction: 'TX', description: 'Notificaciones desactivadas');
     } catch (_) {}
     await _notifySubscription?.cancel();
     if (mounted) setState(() => _isListening = false);
@@ -205,8 +315,29 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
     });
   }
 
+  // ─── Logs bottom sheet ───────────────────────────────────────────────────
+  void _showLogsSheet() {
+    setState(() => _isFabExpanded = false);
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => _BleLogsSheet(
+        logs: _logs,
+        onClear: () {
+          setState(() => _logs.clear());
+          Navigator.pop(context);
+          _showSnack('Logs limpiados');
+        },
+        formatTime: _formatTime,
+        formatDate: _formatDate,
+      ),
+    );
+  }
+
   // ─── Export to Excel ─────────────────────────────────────────────────────
   Future<void> _exportToExcel() async {
+    setState(() => _isFabExpanded = false);
     if (_tags.isEmpty) {
       _showSnack('No hay lecturas para exportar', isError: true);
       return;
@@ -216,22 +347,9 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
     try {
       final excel = xl.Excel.createExcel();
 
-      // ── Hoja principal ──────────────────────────────────────────────────
       final xl.Sheet sheet = excel['Lecturas RFID'];
-      excel.delete('Sheet1'); // eliminar hoja default
+      excel.delete('Sheet1');
 
-      // Estilos
-      final headerFill = xl.CellStyle(
-        backgroundColorHex: xl.ExcelColor.fromHexString('#1154B4'),
-        // azul oscuro
-      );
-      final headerFont = xl.CellStyle(
-        fontFamily: xl.getFontFamily(xl.FontFamily.Arial),
-        bold: true,
-        fontColorHex: xl.ExcelColor.white,
-        backgroundColorHex: xl.ExcelColor.fromHexString('#1154B4'),
-        horizontalAlign: xl.HorizontalAlign.Center,
-      );
       final evenRowStyle = xl.CellStyle(
         fontFamily: xl.getFontFamily(xl.FontFamily.Arial),
         backgroundColorHex: xl.ExcelColor.fromHexString('#EEF3FB'),
@@ -240,12 +358,7 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
         fontFamily: xl.getFontFamily(xl.FontFamily.Arial),
         backgroundColorHex: xl.ExcelColor.white,
       );
-      final monoStyle = xl.CellStyle(
-        fontFamily: 'Courier New',
-        backgroundColorHex: xl.ExcelColor.fromHexString('#EEF3FB'),
-      );
 
-      // ── Encabezados ─────────────────────────────────────────────────────
       final headers = [
         '#',
         'UID / Código',
@@ -262,7 +375,6 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
         cell.cellStyle = headerStyle;
       }
 
-      // ── Datos ────────────────────────────────────────────────────────────
       for (int i = 0; i < _tags.length; i++) {
         final tag = _tags[i];
         final rowIdx = i + 1;
@@ -279,7 +391,7 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
               );
 
         final rowData = [
-          xl.IntCellValue(_tags.length - i), // número (más reciente = mayor)
+          xl.IntCellValue(_tags.length - i),
           xl.TextCellValue(tag.uid),
           xl.TextCellValue(_formatDate(tag.timestamp)),
           xl.TextCellValue(_formatTime(tag.timestamp)),
@@ -296,36 +408,28 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
         }
       }
 
-      // ── Fila de resumen ──────────────────────────────────────────────────
       final summaryRow = _tags.length + 2;
       sheet
           .cell(
             xl.CellIndex.indexByColumnRow(columnIndex: 0, rowIndex: summaryRow),
           )
-          .value = xl.TextCellValue(
-        'Total de lecturas:',
-      );
+          .value = xl.TextCellValue('Total de lecturas:');
       sheet
           .cell(
             xl.CellIndex.indexByColumnRow(columnIndex: 1, rowIndex: summaryRow),
           )
-          .value = xl.TextCellValue(
-        '=COUNTA(B2:B${_tags.length + 1})',
-      );
+          .value = xl.TextCellValue('=COUNTA(B2:B${_tags.length + 1})');
 
-      // ── Ancho de columnas ────────────────────────────────────────────────
-      sheet.setColumnWidth(0, 6); // #
-      sheet.setColumnWidth(1, 26); // UID
-      sheet.setColumnWidth(2, 14); // Fecha
-      sheet.setColumnWidth(3, 12); // Hora
-      sheet.setColumnWidth(4, 14); // RSSI
-      sheet.setColumnWidth(5, 52); // Raw HEX
+      sheet.setColumnWidth(0, 6);
+      sheet.setColumnWidth(1, 26);
+      sheet.setColumnWidth(2, 14);
+      sheet.setColumnWidth(3, 12);
+      sheet.setColumnWidth(4, 14);
+      sheet.setColumnWidth(5, 52);
 
-      // ── Hoja de resumen ──────────────────────────────────────────────────
       final xl.Sheet summary = excel['Resumen'];
       _buildSummarySheet(summary);
 
-      // ── Guardar y compartir ──────────────────────────────────────────────
       final bytes = excel.encode();
       if (bytes == null)
         throw Exception('No se pudo codificar el archivo Excel');
@@ -354,7 +458,6 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
   }
 
   void _buildSummarySheet(xl.Sheet sheet) {
-    // Conteo por UID único
     final Map<String, int> counts = {};
     for (final tag in _tags) {
       counts[tag.uid] = (counts[tag.uid] ?? 0) + 1;
@@ -389,14 +492,10 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
 
       sheet
           .cell(xl.CellIndex.indexByColumnRow(columnIndex: 0, rowIndex: i + 1))
-          .value = xl.TextCellValue(
-        uid,
-      );
+          .value = xl.TextCellValue(uid);
       sheet
           .cell(xl.CellIndex.indexByColumnRow(columnIndex: 1, rowIndex: i + 1))
-          .value = xl.IntCellValue(
-        sorted[i].value,
-      );
+          .value = xl.IntCellValue(sorted[i].value);
       sheet
           .cell(xl.CellIndex.indexByColumnRow(columnIndex: 2, rowIndex: i + 1))
           .value = xl.TextCellValue(
@@ -446,19 +545,24 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
   // ─── Build ───────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: _C.bg,
-      appBar: _buildAppBar(),
-      body: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          _buildDeviceHeader(),
-          _buildStatsBar(),
-          const _Divider(),
-          Expanded(child: _buildTagList()),
-        ],
+    return GestureDetector(
+      onTap: () {
+        if (_isFabExpanded) setState(() => _isFabExpanded = false);
+      },
+      child: Scaffold(
+        backgroundColor: _C.bg,
+        appBar: _buildAppBar(),
+        body: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            _buildDeviceHeader(),
+            _buildStatsBar(),
+            const _Divider(),
+            Expanded(child: _buildTagList()),
+          ],
+        ),
+        floatingActionButton: _buildExpandableFAB(),
       ),
-      floatingActionButton: _buildFAB(),
     );
   }
 
@@ -486,7 +590,6 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
             tooltip: 'Limpiar lecturas',
             onPressed: _clearTags,
           ),
-        // Toggle escucha
         Padding(
           padding: const EdgeInsets.only(right: 8),
           child: TextButton.icon(
@@ -514,7 +617,6 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
     );
   }
 
-  // ── Cabecera con info del dispositivo conectado ──────────────────────────
   Widget _buildDeviceHeader() {
     return Container(
       margin: const EdgeInsets.fromLTRB(16, 14, 16, 0),
@@ -534,7 +636,6 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
       ),
       child: Row(
         children: [
-          // Indicador de estado
           Container(
             width: 48,
             height: 48,
@@ -601,7 +702,6 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
               ],
             ),
           ),
-          // Estado de escucha
           Column(
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
@@ -633,7 +733,6 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
     );
   }
 
-  // ── Barra de estadísticas ────────────────────────────────────────────────
   Widget _buildStatsBar() {
     final uniqueUids = _tags.map((t) => t.uid).toSet().length;
     return Padding(
@@ -665,7 +764,6 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
     );
   }
 
-  // ── Lista de tags ────────────────────────────────────────────────────────
   Widget _buildTagList() {
     if (_tags.isEmpty) {
       return Center(
@@ -736,7 +834,6 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
         child: Row(
           children: [
-            // Número de orden
             Container(
               width: 34,
               height: 34,
@@ -760,7 +857,6 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // UID
                   Row(
                     children: [
                       Icon(Icons.nfc, size: 13, color: _C.accent),
@@ -782,7 +878,6 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
                     ],
                   ),
                   const SizedBox(height: 4),
-                  // Raw HEX
                   Text(
                     tag.raw,
                     style: TextStyle(
@@ -834,34 +929,138 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
     );
   }
 
-  // ── FAB exportar ─────────────────────────────────────────────────────────
-  Widget _buildFAB() {
-    return FloatingActionButton.extended(
-      onPressed: _tags.isEmpty || _isExporting ? null : _exportToExcel,
-      backgroundColor: _tags.isEmpty
-          ? _C.border
-          : (_isExporting ? _C.warning : _C.export),
-      elevation: _tags.isEmpty ? 0 : 4,
-      icon: _isExporting
-          ? SizedBox(
-              width: 18,
-              height: 18,
-              child: CircularProgressIndicator(
-                strokeWidth: 2,
-                color: Colors.white,
+  // ─── Expandable FAB ─────────────────────────────────────────────────────
+  Widget _buildExpandableFAB() {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.end,
+      children: [
+        // ── Opciones expandidas ──
+        AnimatedSwitcher(
+          duration: const Duration(milliseconds: 250),
+          transitionBuilder: (child, anim) => FadeTransition(
+            opacity: anim,
+            child: SlideTransition(
+              position: Tween<Offset>(
+                begin: const Offset(0, 0.3),
+                end: Offset.zero,
+              ).animate(anim),
+              child: child,
+            ),
+          ),
+          child: _isFabExpanded
+              ? Column(
+                  key: const ValueKey('expanded'),
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    // ── Botón: Ver Logs ──
+                    _FabOption(
+                      icon: Icons.terminal,
+                      label: 'Ver Logs (${_logs.length})',
+                      color: _C.accent,
+                      onTap: _showLogsSheet,
+                    ),
+                    const SizedBox(height: 10),
+                    // ── Botón: Exportar Excel ──
+                    _FabOption(
+                      icon: Icons.file_download_outlined,
+                      label: _tags.isEmpty
+                          ? 'Sin datos'
+                          : 'Exportar Excel (${_tags.length})',
+                      color: _tags.isEmpty ? _C.border : _C.export,
+                      onTap:
+                          _tags.isEmpty || _isExporting
+                              ? null
+                              : _exportToExcel,
+                      isLoading: _isExporting,
+                    ),
+                    const SizedBox(height: 12),
+                  ],
+                )
+              : const SizedBox.shrink(key: ValueKey('collapsed')),
+        ),
+        // ── FAB principal ──
+        FloatingActionButton(
+          onPressed: () => setState(() => _isFabExpanded = !_isFabExpanded),
+          backgroundColor: _C.accent,
+          elevation: 4,
+          child: AnimatedRotation(
+            turns: _isFabExpanded ? 0.125 : 0,
+            duration: const Duration(milliseconds: 250),
+            child: const Icon(Icons.add, color: Colors.white, size: 28),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FAB option mini-button
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _FabOption extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final Color color;
+  final VoidCallback? onTap;
+  final bool isLoading;
+
+  const _FabOption({
+    required this.icon,
+    required this.label,
+    required this.color,
+    this.onTap,
+    this.isLoading = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(28),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          decoration: BoxDecoration(
+            color: _C.surface,
+            borderRadius: BorderRadius.circular(28),
+            border: Border.all(color: color.withOpacity(0.3)),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.25),
+                blurRadius: 8,
+                offset: const Offset(0, 3),
               ),
-            )
-          : const Icon(Icons.file_download_outlined, color: Colors.white),
-      label: Text(
-        _isExporting
-            ? 'Exportando...'
-            : _tags.isEmpty
-            ? 'Sin datos'
-            : 'Exportar Excel (${_tags.length})',
-        style: TextStyle(
-          color: _tags.isEmpty ? _C.textSecondary : Colors.white,
-          fontWeight: FontWeight.w600,
-          fontSize: 13,
+            ],
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (isLoading)
+                SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: color,
+                  ),
+                )
+              else
+                Icon(icon, size: 16, color: color),
+              const SizedBox(width: 8),
+              Text(
+                label,
+                style: TextStyle(
+                  color: onTap == null ? _C.textSecondary : _C.textPrimary,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -869,7 +1068,369 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Estilos de celda reutilizables (definidos fuera para evitar recrearlos)
+// BLE Logs Bottom Sheet
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _BleLogsSheet extends StatefulWidget {
+  final List<BleLogEntry> logs;
+  final VoidCallback onClear;
+  final String Function(DateTime) formatTime;
+  final String Function(DateTime) formatDate;
+
+  const _BleLogsSheet({
+    required this.logs,
+    required this.onClear,
+    required this.formatTime,
+    required this.formatDate,
+  });
+
+  @override
+  State<_BleLogsSheet> createState() => _BleLogsSheetState();
+}
+
+class _BleLogsSheetState extends State<_BleLogsSheet> {
+  String _filter = 'ALL'; // ALL, RX, TX, SYS
+  bool _autoScroll = true;
+  final ScrollController _logScrollCtrl = ScrollController();
+
+  @override
+  void dispose() {
+    _logScrollCtrl.dispose();
+    super.dispose();
+  }
+
+  List<BleLogEntry> get _filteredLogs => _filter == 'ALL'
+      ? widget.logs
+      : widget.logs.where((l) => l.direction == _filter).toList();
+
+  Color _directionColor(String dir) {
+    switch (dir) {
+      case 'RX':
+        return _C.success;
+      case 'TX':
+        return _C.accent;
+      case 'SYS':
+        return _C.warning;
+      default:
+        return _C.textSecondary;
+    }
+  }
+
+  IconData _directionIcon(String dir) {
+    switch (dir) {
+      case 'RX':
+        return Icons.arrow_downward;
+      case 'TX':
+        return Icons.arrow_upward;
+      case 'SYS':
+        return Icons.info_outline;
+      default:
+        return Icons.circle;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final filtered = _filteredLogs;
+    final mediaQuery = MediaQuery.of(context);
+
+    return Container(
+      height: mediaQuery.size.height * 0.85,
+      decoration: BoxDecoration(
+        color: _C.bg,
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      child: Column(
+        children: [
+          // ── Handle ──
+          Center(
+            child: Container(
+              margin: const EdgeInsets.only(top: 10, bottom: 6),
+              width: 36,
+              height: 4,
+              decoration: BoxDecoration(
+                color: _C.border,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+          ),
+          // ── Header ──
+          Padding(
+            padding: const EdgeInsets.fromLTRB(18, 6, 12, 6),
+            child: Row(
+              children: [
+                Icon(Icons.terminal, color: _C.accent, size: 20),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Logs BLE',
+                        style: TextStyle(
+                          color: _C.textPrimary,
+                          fontSize: 16,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      Text(
+                        '${widget.logs.length} entradas • ${filtered.length} visibles',
+                        style: TextStyle(
+                          color: _C.textSecondary,
+                          fontSize: 11,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                IconButton(
+                  icon: Icon(
+                    Icons.delete_outline,
+                    color: _C.error,
+                    size: 20,
+                  ),
+                  tooltip: 'Limpiar logs',
+                  onPressed: widget.onClear,
+                ),
+                IconButton(
+                  icon: Icon(
+                    Icons.close,
+                    color: _C.textSecondary,
+                    size: 20,
+                  ),
+                  onPressed: () => Navigator.pop(context),
+                ),
+              ],
+            ),
+          ),
+          // ── Filtros ──
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Row(
+              children: [
+                _LogFilterChip(
+                  label: 'Todo',
+                  isActive: _filter == 'ALL',
+                  color: _C.textPrimary,
+                  onTap: () => setState(() => _filter = 'ALL'),
+                ),
+                const SizedBox(width: 6),
+                _LogFilterChip(
+                  label: 'RX',
+                  isActive: _filter == 'RX',
+                  color: _C.success,
+                  onTap: () => setState(() => _filter = 'RX'),
+                ),
+                const SizedBox(width: 6),
+                _LogFilterChip(
+                  label: 'TX',
+                  isActive: _filter == 'TX',
+                  color: _C.accent,
+                  onTap: () => setState(() => _filter = 'TX'),
+                ),
+                const SizedBox(width: 6),
+                _LogFilterChip(
+                  label: 'SYS',
+                  isActive: _filter == 'SYS',
+                  color: _C.warning,
+                  onTap: () => setState(() => _filter = 'SYS'),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 8),
+          Container(height: 1, color: _C.border),
+          // ── Log list ──
+          Expanded(
+            child: filtered.isEmpty
+                ? Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.receipt_long_outlined,
+                          size: 40,
+                          color: _C.textSecondary.withOpacity(0.4),
+                        ),
+                        const SizedBox(height: 10),
+                        Text(
+                          'Sin logs',
+                          style: TextStyle(
+                            color: _C.textSecondary,
+                            fontSize: 14,
+                          ),
+                        ),
+                      ],
+                    ),
+                  )
+                : ListView.builder(
+                    controller: _logScrollCtrl,
+                    padding: const EdgeInsets.fromLTRB(12, 8, 12, 24),
+                    itemCount: filtered.length,
+                    itemBuilder: (_, i) => _buildLogEntry(filtered[i]),
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLogEntry(BleLogEntry entry) {
+    final dirColor = _directionColor(entry.direction);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+        decoration: BoxDecoration(
+          color: _C.surface,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: _C.border.withOpacity(0.5)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                // Direction badge
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 5,
+                    vertical: 2,
+                  ),
+                  decoration: BoxDecoration(
+                    color: dirColor.withOpacity(0.15),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        _directionIcon(entry.direction),
+                        size: 10,
+                        color: dirColor,
+                      ),
+                      const SizedBox(width: 3),
+                      Text(
+                        entry.direction,
+                        style: TextStyle(
+                          color: dirColor,
+                          fontSize: 9,
+                          fontWeight: FontWeight.w800,
+                          fontFamily: 'monospace',
+                          letterSpacing: 0.5,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+                // Timestamp
+                Text(
+                  widget.formatTime(entry.timestamp),
+                  style: TextStyle(
+                    color: _C.textSecondary,
+                    fontSize: 10,
+                    fontFamily: 'monospace',
+                  ),
+                ),
+                if (entry.byteCount > 0) ...[
+                  const SizedBox(width: 8),
+                  Text(
+                    '${entry.byteCount}B',
+                    style: TextStyle(
+                      color: _C.textSecondary.withOpacity(0.6),
+                      fontSize: 9,
+                      fontFamily: 'monospace',
+                    ),
+                  ),
+                ],
+              ],
+            ),
+            const SizedBox(height: 4),
+            // Description
+            Text(
+              entry.description,
+              style: TextStyle(
+                color: _C.textPrimary,
+                fontSize: 12,
+                fontFamily: 'monospace',
+                height: 1.4,
+              ),
+            ),
+            // Raw HEX data
+            if (entry.rawHex.isNotEmpty) ...[
+              const SizedBox(height: 3),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(6),
+                decoration: BoxDecoration(
+                  color: _C.bg,
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Text(
+                  entry.rawHex,
+                  style: TextStyle(
+                    color: _C.accent.withOpacity(0.8),
+                    fontSize: 10,
+                    fontFamily: 'monospace',
+                    letterSpacing: 0.5,
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Log filter chip
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _LogFilterChip extends StatelessWidget {
+  final String label;
+  final bool isActive;
+  final Color color;
+  final VoidCallback onTap;
+
+  const _LogFilterChip({
+    required this.label,
+    required this.isActive,
+    required this.color,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        decoration: BoxDecoration(
+          color: isActive ? color.withOpacity(0.15) : _C.surface,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: isActive ? color.withOpacity(0.4) : _C.border,
+          ),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: isActive ? color : _C.textSecondary,
+            fontSize: 11,
+            fontWeight: isActive ? FontWeight.w700 : FontWeight.w500,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Estilos de celda reutilizables
 // ─────────────────────────────────────────────────────────────────────────────
 
 final headerStyle = xl.CellStyle(
@@ -948,7 +1509,6 @@ class _StatChip extends StatelessWidget {
   }
 }
 
-/// Punto animado que pulsa para indicar actividad
 class _PulsingDot extends StatefulWidget {
   final Color color;
   const _PulsingDot({required this.color});
