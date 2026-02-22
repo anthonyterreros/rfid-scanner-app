@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:test_app/pages/rfid_reader_page.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Page
@@ -143,6 +144,7 @@ class _BluetoothScannerPageState extends State<BluetoothScannerPage> {
     if (_isConnecting || _connectedDevice != null) return;
 
     // Detener el escaneo antes de conectar (crítico en Android)
+    print(device);
     if (FlutterBluePlus.isScanningNow) await _stopScan();
     await Future.delayed(const Duration(milliseconds: 300));
 
@@ -151,10 +153,10 @@ class _BluetoothScannerPageState extends State<BluetoothScannerPage> {
       _connectingDeviceId = device.remoteId.str;
     });
 
-    for (int attempt = 1; attempt <= 3; attempt++) {
+    for (int attempt = 1; attempt <= 2; attempt++) {
       try {
         await device.connect(
-          timeout: const Duration(seconds: 20),
+          timeout: const Duration(seconds: 10),
           autoConnect: false,
         );
 
@@ -658,11 +660,31 @@ class _BluetoothScannerPageState extends State<BluetoothScannerPage> {
             ),
             const SizedBox(width: 10),
             if (isConnected)
-              _ActionChip(
-                label: 'Conectado',
-                color: _AppColors.success,
-                icon: Icons.check_circle_outline,
-                enabled: false,
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _ActionChip(
+                    label: 'Conectado',
+                    color: _AppColors.success,
+                    icon: Icons.check_circle_outline,
+                    enabled: false,
+                  ), // ← igual que antes
+                  const SizedBox(width: 6),
+                  _ActionChip(
+                    // ← nuevo
+                    label: 'RFID',
+                    color: _AppColors.accent,
+                    icon: Icons.nfc,
+                    enabled: true,
+                    onTap: () => Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) =>
+                            RfidReaderPage(device: _connectedDevice!),
+                      ),
+                    ),
+                  ),
+                ],
               )
             else if (isConnectingThis)
               Padding(
