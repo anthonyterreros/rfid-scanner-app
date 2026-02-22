@@ -272,7 +272,7 @@ class _BluetoothScannerPageState extends State<BluetoothScannerPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: _AppColors.textPrimary,
+      backgroundColor: _AppColors.bg,
       appBar: _buildAppBar(),
       body: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -316,14 +316,14 @@ class _BluetoothScannerPageState extends State<BluetoothScannerPage> {
 
   PreferredSizeWidget _buildAppBar() {
     return AppBar(
-      backgroundColor: _AppColors.surface,
+      backgroundColor: _AppColors.bgAppBar,
       elevation: 0,
       title: Row(
         children: [
           Container(
             padding: const EdgeInsets.all(7),
             decoration: BoxDecoration(
-              color: _AppColors.accent.withOpacity(0.15),
+              color: _AppColors.textSecondaryAppBar,
               borderRadius: BorderRadius.circular(10),
             ),
             child: Icon(Icons.bluetooth, color: _AppColors.accent, size: 22),
@@ -335,7 +335,7 @@ class _BluetoothScannerPageState extends State<BluetoothScannerPage> {
               Text(
                 'BT Scanner',
                 style: TextStyle(
-                  color: _AppColors.textPrimary,
+                  color: _AppColors.textPrimaryAppBar,
                   fontSize: 17,
                   fontWeight: FontWeight.w700,
                   letterSpacing: 0.3,
@@ -343,7 +343,10 @@ class _BluetoothScannerPageState extends State<BluetoothScannerPage> {
               ),
               Text(
                 '${_scanResults.length} dispositivo${_scanResults.length != 1 ? 's' : ''}',
-                style: TextStyle(color: _AppColors.textSecondary, fontSize: 11),
+                style: TextStyle(
+                  color: _AppColors.textSecondaryAppBar,
+                  fontSize: 11,
+                ),
               ),
             ],
           ),
@@ -664,7 +667,7 @@ class _BluetoothScannerPageState extends State<BluetoothScannerPage> {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   _ActionChip(
-                    label: 'Conectado',
+                    label: 'Con.',
                     color: _AppColors.success,
                     icon: Icons.check_circle_outline,
                     enabled: false,
@@ -809,7 +812,7 @@ class _ActionChip extends StatelessWidget {
 // Paleta
 // ─────────────────────────────────────────────────────────────────────────────
 
-abstract class _AppColors {
+abstract class _AppColorsDark {
   static const bg = Color(0xFF0F1117);
   static const surface = Color(0xFF1A1D27);
   static const border = Color(0xFF252836);
@@ -819,4 +822,20 @@ abstract class _AppColors {
   static const error = Color(0xFFFF5C72);
   static const textPrimary = Color(0xFFEEF0F6);
   static const textSecondary = Color(0xFF7B82A0);
+}
+
+abstract class _AppColors {
+  static const bgAppBar = Color(0xFF2563EB);
+  static const bg = Color(0xFFF5F7FA);
+  static const surface = Color(0xFFFFFFFF);
+  static const border = Color(0xFFE2E6ED);
+  static const accent = Color(0xFF2563EB);
+  static const success = Color(0xFF16A34A);
+  static const warning = Color(0xFFD97706);
+  static const error = Color(0xFFDC2626);
+  static const export = Color(0xFF16A34A);
+  static const textPrimary = Color(0xFF1A1D27);
+  static const textPrimaryAppBar = Color.fromRGBO(255, 255, 255, 1);
+  static const textSecondary = Color(0xFF6B7280);
+  static const textSecondaryAppBar = Color.fromRGBO(224, 224, 224, 1);
 }

@@ -232,30 +232,31 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
 
       _addLog(direction: 'SYS', description: 'Notificaciones activadas ✓');
 
-      _notifySubscription = _notifyCharacteristic!.onValueReceived.listen((
-        bytes,
-      ) {
-        if (bytes.isEmpty || !mounted) return;
+      _notifySubscription = _notifyCharacteristic!.onValueReceived.listen(
+        (bytes) {
+          if (bytes.isEmpty || !mounted) return;
 
-        final hexStr = bytes
-            .map((b) => b.toRadixString(16).padLeft(2, '0'))
-            .join(' ')
-            .toUpperCase();
+          final hexStr = bytes
+              .map((b) => b.toRadixString(16).padLeft(2, '0'))
+              .join(' ')
+              .toUpperCase();
 
-        _addLog(
-          direction: 'RX',
-          description: 'Datos recibidos (${bytes.length} bytes)',
-          rawHex: hexStr,
-          byteCount: bytes.length,
-        );
+          _addLog(
+            direction: 'RX',
+            description: 'Datos recibidos (${bytes.length} bytes)',
+            rawHex: hexStr,
+            byteCount: bytes.length,
+          );
 
-        final tag = RfidTag.fromBytes(bytes, _currentRssi);
-        setState(() => _tags.insert(0, tag));
-        _autoScroll();
-      }, onError: (e) {
-        _addLog(direction: 'SYS', description: '✖ Error de lectura: $e');
-        _showSnack('Error de lectura: $e', isError: true);
-      });
+          final tag = RfidTag.fromBytes(bytes, _currentRssi);
+          setState(() => _tags.insert(0, tag));
+          _autoScroll();
+        },
+        onError: (e) {
+          _addLog(direction: 'SYS', description: '✖ Error de lectura: $e');
+          _showSnack('Error de lectura: $e', isError: true);
+        },
+      );
       if (mounted) setState(() => _isListening = true);
     } catch (e) {
       _addLog(direction: 'SYS', description: '✖ Error al activar NOTIFY: $e');
@@ -413,12 +414,16 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
           .cell(
             xl.CellIndex.indexByColumnRow(columnIndex: 0, rowIndex: summaryRow),
           )
-          .value = xl.TextCellValue('Total de lecturas:');
+          .value = xl.TextCellValue(
+        'Total de lecturas:',
+      );
       sheet
           .cell(
             xl.CellIndex.indexByColumnRow(columnIndex: 1, rowIndex: summaryRow),
           )
-          .value = xl.TextCellValue('=COUNTA(B2:B${_tags.length + 1})');
+          .value = xl.TextCellValue(
+        '=COUNTA(B2:B${_tags.length + 1})',
+      );
 
       sheet.setColumnWidth(0, 6);
       sheet.setColumnWidth(1, 26);
@@ -492,10 +497,14 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
 
       sheet
           .cell(xl.CellIndex.indexByColumnRow(columnIndex: 0, rowIndex: i + 1))
-          .value = xl.TextCellValue(uid);
+          .value = xl.TextCellValue(
+        uid,
+      );
       sheet
           .cell(xl.CellIndex.indexByColumnRow(columnIndex: 1, rowIndex: i + 1))
-          .value = xl.IntCellValue(sorted[i].value);
+          .value = xl.IntCellValue(
+        sorted[i].value,
+      );
       sheet
           .cell(xl.CellIndex.indexByColumnRow(columnIndex: 2, rowIndex: i + 1))
           .value = xl.TextCellValue(
@@ -568,16 +577,20 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
 
   PreferredSizeWidget _buildAppBar() {
     return AppBar(
-      backgroundColor: _C.surface,
+      backgroundColor: _C.bgAppBar,
       elevation: 0,
       leading: IconButton(
-        icon: Icon(Icons.arrow_back_ios_new, color: _C.textSecondary, size: 18),
+        icon: Icon(
+          Icons.arrow_back_ios_new,
+          color: _C.textSecondaryAppBar,
+          size: 18,
+        ),
         onPressed: () => Navigator.pop(context),
       ),
       title: Text(
         'Lector RFID',
         style: TextStyle(
-          color: _C.textPrimary,
+          color: _C.textPrimaryAppBar,
           fontSize: 17,
           fontWeight: FontWeight.w700,
           letterSpacing: 0.3,
@@ -602,6 +615,17 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
                   : Icons.play_circle_outline,
               size: 18,
               color: _isListening ? _C.warning : _C.success,
+            ),
+            style: TextButton.styleFrom(
+              backgroundColor: Colors.grey[100],
+              elevation: 2,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(20), // Ajusta el radio aquí
+              ),
+              side: BorderSide(
+                color: _isListening ? _C.warning : _C.success,
+                width: 1,
+              ), // Opcional: añade un borde lineal
             ),
             label: Text(
               _isListening ? 'Pausar' : 'Escuchar',
@@ -969,10 +993,9 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
                           ? 'Sin datos'
                           : 'Exportar Excel (${_tags.length})',
                       color: _tags.isEmpty ? _C.border : _C.export,
-                      onTap:
-                          _tags.isEmpty || _isExporting
-                              ? null
-                              : _exportToExcel,
+                      onTap: _tags.isEmpty || _isExporting
+                          ? null
+                          : _exportToExcel,
                       isLoading: _isExporting,
                     ),
                     const SizedBox(height: 12),
@@ -1175,29 +1198,18 @@ class _BleLogsSheetState extends State<_BleLogsSheet> {
                       ),
                       Text(
                         '${widget.logs.length} entradas • ${filtered.length} visibles',
-                        style: TextStyle(
-                          color: _C.textSecondary,
-                          fontSize: 11,
-                        ),
+                        style: TextStyle(color: _C.textSecondary, fontSize: 11),
                       ),
                     ],
                   ),
                 ),
                 IconButton(
-                  icon: Icon(
-                    Icons.delete_outline,
-                    color: _C.error,
-                    size: 20,
-                  ),
+                  icon: Icon(Icons.delete_outline, color: _C.error, size: 20),
                   tooltip: 'Limpiar logs',
                   onPressed: widget.onClear,
                 ),
                 IconButton(
-                  icon: Icon(
-                    Icons.close,
-                    color: _C.textSecondary,
-                    size: 20,
-                  ),
+                  icon: Icon(Icons.close, color: _C.textSecondary, size: 20),
                   onPressed: () => Navigator.pop(context),
                 ),
               ],
@@ -1555,7 +1567,7 @@ class _PulsingDotState extends State<_PulsingDot>
 // Paleta
 // ─────────────────────────────────────────────────────────────────────────────
 
-abstract class _C {
+abstract class _CDark {
   static const bg = Color(0xFF0F1117);
   static const surface = Color(0xFF1A1D27);
   static const border = Color(0xFF252836);
@@ -1566,4 +1578,20 @@ abstract class _C {
   static const export = Color(0xFF22C55E);
   static const textPrimary = Color(0xFFEEF0F6);
   static const textSecondary = Color(0xFF7B82A0);
+}
+
+abstract class _C {
+  static const bgAppBar = Color(0xFF2563EB);
+  static const bg = Color(0xFFF5F7FA);
+  static const surface = Color(0xFFFFFFFF);
+  static const border = Color(0xFFE2E6ED);
+  static const accent = Color(0xFF2563EB);
+  static const success = Color(0xFF16A34A);
+  static const warning = Color(0xFFD97706);
+  static const error = Color(0xFFDC2626);
+  static const export = Color(0xFF16A34A);
+  static const textPrimary = Color(0xFF1A1D27);
+  static const textPrimaryAppBar = Color.fromRGBO(255, 255, 255, 1);
+  static const textSecondary = Color(0xFF6B7280);
+  static const textSecondaryAppBar = Color.fromRGBO(224, 224, 224, 1);
 }
