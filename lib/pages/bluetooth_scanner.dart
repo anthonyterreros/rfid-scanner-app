@@ -666,15 +666,14 @@ class _BluetoothScannerPageState extends State<BluetoothScannerPage> {
               Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
+                  // _ActionChip(
+                  //   label: 'Con.',
+                  //   color: _AppColors.success,
+                  //   icon: Icons.check_circle_outline,
+                  //   enabled: false,
+                  // ), // ← igual que antes
+                  // const SizedBox(width: 6),
                   _ActionChip(
-                    label: 'Con.',
-                    color: _AppColors.success,
-                    icon: Icons.check_circle_outline,
-                    enabled: false,
-                  ), // ← igual que antes
-                  const SizedBox(width: 6),
-                  _ActionChip(
-                    // ← nuevo
                     label: 'RFID',
                     color: _AppColors.accent,
                     icon: Icons.nfc,

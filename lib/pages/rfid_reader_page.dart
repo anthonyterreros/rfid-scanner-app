@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:convert';
+import 'dart:developer' as dev;
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -148,11 +150,29 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
     });
   }
 
+  void printFull(dynamic data) {
+    try {
+      // Si es un Map o List, lo formateamos con 2 espacios de indentación
+      JsonEncoder encoder = const JsonEncoder.withIndent('  ');
+      String prettyString = encoder.convert(data);
+
+      // Usamos dev.log para asegurar que no haya recortes de caracteres
+      dev.log(prettyString, name: 'APP_DEBUG');
+    } catch (e) {
+      // Si no es un objeto JSON, simplemente lo imprimimos como String
+      dev.log(data.toString(), name: 'APP_DEBUG');
+    }
+  }
+
   // ─── GATT discovery ──────────────────────────────────────────────────────
   Future<void> _discoverAndListen() async {
     try {
       _addLog(direction: 'TX', description: 'Descubriendo servicios GATT...');
       final services = await widget.device.discoverServices();
+      print('************************');
+      print('$services');
+      printFull(services);
+      print('************************');
 
       _addLog(
         direction: 'RX',
@@ -176,14 +196,16 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
           _addLog(
             direction: 'RX',
             description:
-                '  └─ Char: ${chr.uuid.toString().toUpperCase()}  [${props.join(", ")}]',
+                '  └─ Char: ${chr.uuid.toString().toUpperCase()}  [${props.join(", ")}] ${chr.serviceUuid}',
           );
         }
       }
 
       BluetoothCharacteristic? found;
       for (final svc in services) {
+        print(svc);
         for (final chr in svc.characteristics) {
+          print(chr);
           if (chr.properties.notify || chr.properties.indicate) {
             found = chr;
             break;
@@ -220,6 +242,7 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
 
   // ─── Notify subscription ─────────────────────────────────────────────────
   Future<void> _startListening() async {
+    print('START LISTENING:  $_notifyCharacteristic');
     if (_notifyCharacteristic == null) return;
     try {
       _addLog(
