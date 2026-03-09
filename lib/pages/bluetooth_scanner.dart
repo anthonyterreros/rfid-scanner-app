@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:test_app/pages/rfid_reader_page.dart';
+import 'package:test_app/pages/uhf_rfid_reader_page.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Page
@@ -682,7 +683,7 @@ class _BluetoothScannerPageState extends State<BluetoothScannerPage> {
                       context,
                       MaterialPageRoute(
                         builder: (_) =>
-                            RfidReaderPage(device: _connectedDevice!),
+                            UhfRfidReaderPage(device: _connectedDevice!),
                       ),
                     ),
                   ),
