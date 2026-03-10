@@ -12,11 +12,18 @@ import 'package:share_plus/share_plus.dart';
 // El VH-C77P expone NUS sobre BLE. Se escribe al RX y se recibe del TX.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-class _Nus {
-  static const svc = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
-  static const rx = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // WRITE
-  static const tx = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // NOTIFY
-  static bool eq(String a, String b) => a.toLowerCase() == b.toLowerCase();
+class NusUuids {
+  /// Nordic UART Service UUID
+  static const String service = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+
+  /// RX Characteristic – write data TO the device (WRITE / WRITE_NR)
+  static const String rxChar = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+
+  /// TX Characteristic – receive data FROM the device (NOTIFY)
+  static const String txChar = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+
+  /// Helper to compare UUIDs ignoring case
+  static bool match(String a, String b) => a.toLowerCase() == b.toLowerCase();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -322,31 +329,65 @@ class _UhcRfidReaderScanPageState extends State<UhcRfidReaderScanPage> {
         }
       }
 
-      // Buscar NUS
-      BluetoothService? nus;
+      // ─── Validar conexión exclusiva con NUS ─────────────────────────────
+      // Solo se conecta al servicio 6E400001 (Nordic UART Service).
+      // Si el dispositivo no expone NUS, se rechaza la conexión.
+      BluetoothService? nusService;
       for (final s in services) {
-        if (_Nus.eq(s.uuid.toString(), _Nus.svc)) {
-          nus = s;
+        if (NusUuids.match(s.uuid.toString(), NusUuids.service)) {
+          nusService = s;
           break;
         }
       }
-      if (nus == null) {
-        _addLog('SYS', '⚠ Nordic UART Service (NUS) no encontrado');
-        _snack('NUS no encontrado en el dispositivo', err: true);
+      if (nusService == null) {
+        _addLog(
+          'SYS',
+          '⚠ Nordic UART Service (${NusUuids.service.toUpperCase()}) NO encontrado',
+        );
+        _addLog('SYS', '⚠ Este dispositivo no es compatible — se requiere NUS');
+        _snack('NUS no encontrado. Dispositivo no compatible.', err: true);
         return;
       }
 
-      // Buscar TX (NOTIFY) y RX (WRITE)
-      for (final c in nus.characteristics) {
-        if (_Nus.eq(c.uuid.toString(), _Nus.tx)) _txChar = c;
-        if (_Nus.eq(c.uuid.toString(), _Nus.rx)) _rxChar = c;
+      _addLog(
+        'SYS',
+        'Nordic UART Service encontrado ✓ (${nusService.characteristics.length} características)',
+      );
+
+      // ─── Buscar características TX (NOTIFY) y RX (WRITE) dentro del NUS ─
+      // TX = 6E400003 → el lector envía datos aquí (NOTIFY)
+      // RX = 6E400002 → la app escribe comandos aquí (WRITE)
+      for (final c in nusService.characteristics) {
+        final uuid = c.uuid.toString();
+        if (NusUuids.match(uuid, NusUuids.txChar)) {
+          _txChar = c;
+          _addLog(
+            'SYS',
+            'TX Char (NOTIFY) encontrada ✓ ${c.uuid.toString().toUpperCase()}',
+          );
+        } else if (NusUuids.match(uuid, NusUuids.rxChar)) {
+          _rxChar = c;
+          _addLog(
+            'SYS',
+            'RX Char (WRITE) encontrada ✓ ${c.uuid.toString().toUpperCase()}',
+          );
+        }
       }
-      if (_txChar == null || _rxChar == null) {
+
+      if (_txChar == null) {
         _addLog(
           'SYS',
-          '⚠ Características NUS incompletas (TX=${_txChar != null}, RX=${_rxChar != null})',
+          '⚠ TX Characteristic (${NusUuids.txChar.toUpperCase()}) no encontrada en NUS',
         );
-        _snack('Características NUS incompletas', err: true);
+        _snack('Característica TX (NOTIFY) no encontrada', err: true);
+        return;
+      }
+      if (_rxChar == null) {
+        _addLog(
+          'SYS',
+          '⚠ RX Characteristic (${NusUuids.rxChar.toUpperCase()}) no encontrada en NUS',
+        );
+        _snack('Característica RX (WRITE) no encontrada', err: true);
         return;
       }
 
