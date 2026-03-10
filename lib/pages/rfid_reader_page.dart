@@ -1,31 +1,11 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:convert';
-import 'dart:developer' as dev;
-import 'dart:typed_data';
+
+import 'package:excel/excel.dart' as xl;
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
-import 'package:excel/excel.dart' as xl;
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Nordic UART Service (NUS) UUIDs
-// ─────────────────────────────────────────────────────────────────────────────
-
-class NusUuids {
-  /// Nordic UART Service UUID
-  static const String service = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
-
-  /// RX Characteristic – write data TO the device (WRITE / WRITE_NR)
-  static const String rxChar = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
-
-  /// TX Characteristic – receive data FROM the device (NOTIFY)
-  static const String txChar = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
-
-  /// Helper to compare UUIDs ignoring case
-  static bool match(String a, String b) => a.toLowerCase() == b.toLowerCase();
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Modelo de lectura RFID
@@ -44,19 +24,25 @@ class RfidTag {
     required this.raw,
   });
 
-  static RfidTag fromBytes(List<int> bytes, int rssi) {
-    final raw = bytes
+  static String bytesToHex(List<int> bytes) {
+    return bytes
         .map((b) => b.toRadixString(16).padLeft(2, '0'))
         .join(' ')
         .toUpperCase();
-    final uidBytes = bytes.length >= 4
-        ? bytes.sublist(0, bytes.length >= 7 ? 7 : 4)
-        : bytes;
-    final uid = uidBytes
-        .map((b) => b.toRadixString(16).padLeft(2, '0'))
-        .join(':')
-        .toUpperCase();
-    return RfidTag(uid: uid, timestamp: DateTime.now(), rssi: rssi, raw: raw);
+  }
+
+  /// Temporal:
+  /// hasta confirmar el protocolo exacto del VH-C77P,
+  /// usamos el frame completo como UID bruto.
+  static RfidTag fromRawFrame(List<int> bytes, int rssi) {
+    final raw = bytesToHex(bytes);
+    final uid = raw.replaceAll(' ', '');
+    return RfidTag(
+      uid: uid,
+      timestamp: DateTime.now(),
+      rssi: rssi,
+      raw: raw,
+    );
   }
 }
 
@@ -66,7 +52,7 @@ class RfidTag {
 
 class BleLogEntry {
   final DateTime timestamp;
-  final String direction; // 'RX' o 'TX'
+  final String direction; // RX, TX, SYS
   final String description;
   final String rawHex;
   final int byteCount;
@@ -86,6 +72,7 @@ class BleLogEntry {
 
 class RfidReaderPage extends StatefulWidget {
   final BluetoothDevice device;
+
   const RfidReaderPage({super.key, required this.device});
 
   @override
@@ -95,25 +82,33 @@ class RfidReaderPage extends StatefulWidget {
 class _RfidReaderPageState extends State<RfidReaderPage> {
   // ─── State ───────────────────────────────────────────────────────────────
   final List<RfidTag> _tags = [];
+  final Map<String, RfidTag> _uniqueTagsMap = {};
   final List<BleLogEntry> _logs = [];
   final ScrollController _scrollController = ScrollController();
 
   bool _isListening = false;
   bool _isExporting = false;
   bool _isFabExpanded = false;
+  bool _deviceConnected = true;
+  bool _bleReady = false;
+
   int _currentRssi = 0;
+  int _rxFrameCount = 0;
 
-  /// TX Characteristic (NOTIFY) – recibe datos del lector RFID
   BluetoothCharacteristic? _notifyCharacteristic;
-
-  /// RX Characteristic (WRITE) – envía comandos al lector RFID
   BluetoothCharacteristic? _writeCharacteristic;
 
   StreamSubscription<List<int>>? _notifySubscription;
+  StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
+
   final List<int> _rxBuffer = [];
 
-  StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
-  bool _deviceConnected = true;
+  static const String _nusServiceUuid =
+      '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+  static const String _nusWriteUuid =
+      '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+  static const String _nusNotifyUuid =
+      '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
 
   // ─── Lifecycle ───────────────────────────────────────────────────────────
   @override
@@ -139,6 +134,7 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
     int byteCount = 0,
   }) {
     if (!mounted) return;
+
     setState(() {
       _logs.insert(
         0,
@@ -157,35 +153,34 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
   void _watchConnection() {
     _connectionSubscription = widget.device.connectionState.listen((state) {
       if (!mounted) return;
+
       final connected = state == BluetoothConnectionState.connected;
-      setState(() => _deviceConnected = connected);
+
+      setState(() {
+        _deviceConnected = connected;
+      });
 
       _addLog(
         direction: 'SYS',
-        description: connected
-            ? 'Conexión establecida'
-            : 'Dispositivo desconectado',
+        description:
+            connected ? 'Conexión establecida' : 'Dispositivo desconectado',
       );
 
-      if (state == BluetoothConnectionState.disconnected) {
+      if (!connected) {
         _notifySubscription?.cancel();
-        setState(() => _isListening = false);
+        _notifySubscription = null;
+
+        setState(() {
+          _isListening = false;
+          _bleReady = false;
+        });
+
         _showSnack('Dispositivo desconectado', isError: true);
       }
     });
   }
 
-  void printFull(dynamic data) {
-    try {
-      JsonEncoder encoder = const JsonEncoder.withIndent('  ');
-      String prettyString = encoder.convert(data);
-      dev.log(prettyString, name: 'APP_DEBUG');
-    } catch (e) {
-      dev.log(data.toString(), name: 'APP_DEBUG');
-    }
-  }
-
-  // ─── GATT discovery (solo Nordic UART Service) ───────────────────────────
+  // ─── Descubrimiento GATT con NUS fijo ────────────────────────────────────
   Future<void> _discoverAndListen() async {
     try {
       _addLog(direction: 'TX', description: 'Descubriendo servicios GATT...');
@@ -196,13 +191,15 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
         description: '${services.length} servicios descubiertos',
       );
 
-      // Log de todos los servicios y características encontrados
+      BluetoothService? nusService;
+
       for (final svc in services) {
         _addLog(
           direction: 'RX',
           description:
-              'Servicio: ${svc.uuid.toString().toUpperCase()}  (${svc.characteristics.length} características)',
+              'Servicio: ${svc.uuid.toString().toUpperCase()} (${svc.characteristics.length} características)',
         );
+
         for (final chr in svc.characteristics) {
           final props = <String>[];
           if (chr.properties.read) props.add('READ');
@@ -210,97 +207,83 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
           if (chr.properties.writeWithoutResponse) props.add('WRITE_NR');
           if (chr.properties.notify) props.add('NOTIFY');
           if (chr.properties.indicate) props.add('INDICATE');
+
           _addLog(
             direction: 'RX',
             description:
-                '  └─ Char: ${chr.uuid.toString().toUpperCase()}  [${props.join(", ")}]',
+                '  └─ Char: ${chr.uuid.toString().toUpperCase()} [${props.join(", ")}]',
           );
         }
-      }
 
-      // ─── Buscar exclusivamente el Nordic UART Service (NUS) ───────────
-      BluetoothService? nusService;
-      for (final svc in services) {
-        if (NusUuids.match(svc.uuid.toString(), NusUuids.service)) {
+        if (svc.uuid.toString().toLowerCase() == _nusServiceUuid) {
           nusService = svc;
-          break;
         }
       }
 
       if (nusService == null) {
         _addLog(
           direction: 'SYS',
-          description:
-              '⚠ No se encontró el Nordic UART Service (${NusUuids.service.toUpperCase()})',
+          description: '⚠ No se encontró el servicio NUS',
         );
-        _showSnack(
-          'Servicio NUS no encontrado en este dispositivo',
-          isError: true,
-        );
+        _showSnack('Servicio NUS no encontrado', isError: true);
         return;
       }
 
-      _addLog(
-        direction: 'SYS',
-        description:
-            'Nordic UART Service encontrado ✓ (${nusService.characteristics.length} características)',
-      );
-
-      // ─── Localizar TX (NOTIFY) y RX (WRITE) dentro del NUS ───────────
-      BluetoothCharacteristic? txChar;
-      BluetoothCharacteristic? rxChar;
+      BluetoothCharacteristic? notifyChar;
+      BluetoothCharacteristic? writeChar;
 
       for (final chr in nusService.characteristics) {
         final uuid = chr.uuid.toString().toLowerCase();
 
-        if (NusUuids.match(uuid, NusUuids.txChar)) {
-          txChar = chr;
-          _addLog(
-            direction: 'SYS',
-            description:
-                'TX Characteristic (NOTIFY) encontrada ✓ ${chr.uuid.toString().toUpperCase()}',
-          );
-        } else if (NusUuids.match(uuid, NusUuids.rxChar)) {
-          rxChar = chr;
-          _addLog(
-            direction: 'SYS',
-            description:
-                'RX Characteristic (WRITE) encontrada ✓ ${chr.uuid.toString().toUpperCase()}',
-          );
+        if (uuid == _nusNotifyUuid) {
+          notifyChar = chr;
+        } else if (uuid == _nusWriteUuid) {
+          writeChar = chr;
         }
       }
 
-      if (txChar == null) {
+      if (notifyChar == null) {
         _addLog(
           direction: 'SYS',
-          description:
-              '⚠ No se encontró la TX Characteristic (${NusUuids.txChar.toUpperCase()})',
+          description: '⚠ No se encontró NUS notify',
         );
-        _showSnack(
-          'Característica TX (NOTIFY) no encontrada en NUS',
-          isError: true,
-        );
+        _showSnack('NUS notify no encontrado', isError: true);
         return;
       }
 
-      _notifyCharacteristic = txChar;
-      _writeCharacteristic = rxChar; // Disponible para enviar comandos
+      if (writeChar == null) {
+        _addLog(
+          direction: 'SYS',
+          description: '⚠ No se encontró NUS write',
+        );
+        _showSnack('NUS write no encontrado', isError: true);
+        return;
+      }
 
-      await _startListening();
+      _notifyCharacteristic = notifyChar;
+      _writeCharacteristic = writeChar;
+      _bleReady = true;
+
+      _addLog(
+        direction: 'SYS',
+        description:
+            'NUS listo ✓ Notify=${_notifyCharacteristic!.uuid.toString().toUpperCase()} Write=${_writeCharacteristic!.uuid.toString().toUpperCase()}',
+      );
+
+      if (mounted) setState(() {});
+      _showSnack('NUS listo');
     } catch (e) {
       _addLog(direction: 'SYS', description: '✖ Error GATT: $e');
       _showSnack('Error al descubrir servicios: $e', isError: true);
     }
   }
 
-  // ─── Enviar comando al lector (vía RX Characteristic) ────────────────────
-  /// Envía bytes al lector RFID a través de la RX Characteristic del NUS.
-  /// Útil para enviar comandos de configuración o control al lector.
-  Future<void> sendCommand(List<int> bytes) async {
+  // ─── Enviar comando al lector ────────────────────────────────────────────
+  Future<void> sendCommand(List<int> bytes, {String label = 'Comando'}) async {
     if (_writeCharacteristic == null) {
       _addLog(
         direction: 'SYS',
-        description: '⚠ RX Characteristic no disponible para escritura',
+        description: '⚠ No hay characteristic WRITE disponible',
       );
       return;
     }
@@ -313,92 +296,161 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
 
       _addLog(
         direction: 'TX',
-        description: 'Enviando comando (${bytes.length} bytes)',
+        description: '$label (${bytes.length} bytes)',
         rawHex: hexStr,
         byteCount: bytes.length,
       );
 
-      // Usar writeWithoutResponse si está disponible, sino write normal
       await _writeCharacteristic!.write(
         bytes,
         withoutResponse: _writeCharacteristic!.properties.writeWithoutResponse,
       );
 
-      _addLog(direction: 'SYS', description: 'Comando enviado ✓');
+      _addLog(direction: 'SYS', description: '$label enviado ✓');
     } catch (e) {
       _addLog(direction: 'SYS', description: '✖ Error al enviar comando: $e');
       _showSnack('Error al enviar comando: $e', isError: true);
     }
   }
 
-  // ─── Notify subscription ─────────────────────────────────────────────────
+  // ─── Comandos de prueba ──────────────────────────────────────────────────
+  Future<void> _sendStartA0() async {
+    await sendCommand(
+      [0xA0, 0x03, 0x01, 0x00, 0xA4],
+      label: 'START A0',
+    );
+  }
+
+  Future<void> _sendStopA0() async {
+    await sendCommand(
+      [0xA0, 0x03, 0x01, 0x01, 0xA5],
+      label: 'STOP A0',
+    );
+  }
+
+  Future<void> _sendStartBB() async {
+    await sendCommand(
+      [0xBB, 0x00, 0x27, 0x00, 0x27, 0x7E],
+      label: 'START BB',
+    );
+  }
+
+  Future<void> _sendStopBB() async {
+    await sendCommand(
+      [0xBB, 0x00, 0x28, 0x00, 0x28, 0x7E],
+      label: 'STOP BB',
+    );
+  }
+
+  // ─── Inicio de escucha ───────────────────────────────────────────────────
   Future<void> _startListening() async {
-    if (_notifyCharacteristic == null) return;
+    if (!_bleReady || _notifyCharacteristic == null) {
+      _showSnack('BLE/NUS aún no está listo', isError: true);
+      return;
+    }
+
+    if (_isListening) return;
+
     try {
+      _rxBuffer.clear();
+
       _addLog(
         direction: 'TX',
         description:
             'Activando NOTIFY en ${_notifyCharacteristic!.uuid.toString().toUpperCase()}',
       );
+
       await _notifyCharacteristic!.setNotifyValue(true);
+
       _addLog(direction: 'SYS', description: 'Notificaciones NUS activadas ✓');
-      await sendCommand([0xAA, 0x01, 0x00]);
+
+      await _notifySubscription?.cancel();
+
       _notifySubscription = _notifyCharacteristic!.onValueReceived.listen(
         (bytes) {
           if (bytes.isEmpty || !mounted) return;
+
+          _rxFrameCount++;
+
           final hexStr = bytes
               .map((b) => b.toRadixString(16).padLeft(2, '0'))
               .join(' ')
               .toUpperCase();
+
           _addLog(
             direction: 'RX',
-            description: 'Datos NUS recibidos (${bytes.length} bytes)',
+            description: 'Frame recibido #$_rxFrameCount (${bytes.length} bytes)',
             rawHex: hexStr,
             byteCount: bytes.length,
           );
-          final tag = RfidTag.fromBytes(bytes, _currentRssi);
-          setState(() => _tags.insert(0, tag));
-          _autoScroll();
+
+          _handleIncomingBytes(bytes);
         },
         onError: (e) {
-          _addLog(direction: 'SYS', description: '✖ Error de lectura NUS: $e');
+          _addLog(direction: 'SYS', description: '✖ Error de lectura: $e');
           _showSnack('Error de lectura: $e', isError: true);
         },
       );
-      if (mounted) setState(() => _isListening = true);
+
+      if (mounted) {
+        setState(() => _isListening = true);
+      }
+
+      _showSnack('Escucha iniciada');
     } catch (e) {
       _addLog(direction: 'SYS', description: '✖ Error al activar NOTIFY: $e');
       _showSnack('No se pudo activar notificaciones: $e', isError: true);
     }
   }
 
-  int _findCrlf(List<int> data) {
-    for (int i = 0; i < data.length - 1; i++) {
-      if (data[i] == 0x0D && data[i + 1] == 0x0A) {
-        return i;
-      }
-    }
-    return -1;
+  void _handleIncomingBytes(List<int> bytes) {
+    final tag = RfidTag.fromRawFrame(bytes, _currentRssi);
+    _addUniqueTag(tag);
   }
 
+  void _addUniqueTag(RfidTag tag) {
+    final exists = _uniqueTagsMap.containsKey(tag.uid);
+
+    if (exists) {
+      _addLog(
+        direction: 'SYS',
+        description: 'Tag repetido ignorado: ${tag.uid}',
+      );
+      return;
+    }
+
+    _uniqueTagsMap[tag.uid] = tag;
+
+    setState(() {
+      _tags.insert(0, tag);
+    });
+
+    _addLog(
+      direction: 'SYS',
+      description: 'Nuevo tag detectado: ${tag.uid}',
+      rawHex: tag.raw,
+      byteCount: tag.raw.split(' ').length,
+    );
+
+    _autoScroll();
+  }
+
+  // ─── Detener escucha ─────────────────────────────────────────────────────
   Future<void> _stopListening() async {
     try {
-      final ch = _notifyCharacteristic;
-      await sendCommand([0xAA, 0x02, 0x00]);
-
       await _notifySubscription?.cancel();
       _notifySubscription = null;
       _rxBuffer.clear();
 
-      if (ch != null) {
-        await ch.setNotifyValue(false);
+      if (_notifyCharacteristic != null) {
+        await _notifyCharacteristic!.setNotifyValue(false);
       }
 
       if (mounted) {
         setState(() => _isListening = false);
       }
 
-      _addLog(direction: 'SYS', description: 'Notificaciones NUS desactivadas');
+      _addLog(direction: 'SYS', description: 'Escucha detenida');
     } catch (e) {
       _addLog(direction: 'SYS', description: '✖ Error al detener escucha: $e');
       _showSnack('No se pudo detener la escucha: $e', isError: true);
@@ -426,7 +478,10 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
           ),
           TextButton(
             onPressed: () {
-              setState(() => _tags.clear());
+              setState(() {
+                _tags.clear();
+                _uniqueTagsMap.clear();
+              });
               Navigator.pop(context);
             },
             child: Text('Limpiar', style: TextStyle(color: _C.error)),
@@ -451,6 +506,7 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
   // ─── Logs bottom sheet ───────────────────────────────────────────────────
   void _showLogsSheet() {
     setState(() => _isFabExpanded = false);
+
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -471,10 +527,12 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
   // ─── Export to Excel ─────────────────────────────────────────────────────
   Future<void> _exportToExcel() async {
     setState(() => _isFabExpanded = false);
+
     if (_tags.isEmpty) {
       _showSnack('No hay lecturas para exportar', isError: true);
       return;
     }
+
     setState(() => _isExporting = true);
 
     try {
@@ -487,6 +545,7 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
         fontFamily: xl.getFontFamily(xl.FontFamily.Arial),
         backgroundColorHex: xl.ExcelColor.fromHexString('#EEF3FB'),
       );
+
       final oddRowStyle = xl.CellStyle(
         fontFamily: xl.getFontFamily(xl.FontFamily.Arial),
         backgroundColorHex: xl.ExcelColor.white,
@@ -500,6 +559,7 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
         'RSSI (dBm)',
         'Datos Crudos (HEX)',
       ];
+
       for (int col = 0; col < headers.length; col++) {
         final cell = sheet.cell(
           xl.CellIndex.indexByColumnRow(columnIndex: col, rowIndex: 0),
@@ -513,6 +573,7 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
         final rowIdx = i + 1;
         final isEven = rowIdx % 2 == 0;
         final baseStyle = isEven ? evenRowStyle : oddRowStyle;
+
         final baseMonoStyle = isEven
             ? xl.CellStyle(
                 fontFamily: 'Courier New',
@@ -542,20 +603,18 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
       }
 
       final summaryRow = _tags.length + 2;
+
       sheet
           .cell(
             xl.CellIndex.indexByColumnRow(columnIndex: 0, rowIndex: summaryRow),
           )
-          .value = xl.TextCellValue(
-        'Total de lecturas:',
-      );
+          .value = xl.TextCellValue('Total de lecturas:');
+
       sheet
           .cell(
             xl.CellIndex.indexByColumnRow(columnIndex: 1, rowIndex: summaryRow),
           )
-          .value = xl.TextCellValue(
-        '=COUNTA(B2:B${_tags.length + 1})',
-      );
+          .value = xl.TextCellValue('=COUNTA(B2:B${_tags.length + 1})');
 
       sheet.setColumnWidth(0, 6);
       sheet.setColumnWidth(1, 26);
@@ -568,8 +627,9 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
       _buildSummarySheet(summary);
 
       final bytes = excel.encode();
-      if (bytes == null)
+      if (bytes == null) {
         throw Exception('No se pudo codificar el archivo Excel');
+      }
 
       final dir = await getTemporaryDirectory();
       final filename = 'rfid_${DateTime.now().millisecondsSinceEpoch}.xlsx';
@@ -590,7 +650,9 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
     } catch (e) {
       _showSnack('Error al exportar: $e', isError: true);
     } finally {
-      if (mounted) setState(() => _isExporting = false);
+      if (mounted) {
+        setState(() => _isExporting = false);
+      }
     }
   }
 
@@ -599,6 +661,7 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
     for (final tag in _tags) {
       counts[tag.uid] = (counts[tag.uid] ?? 0) + 1;
     }
+
     final sorted = counts.entries.toList()
       ..sort((a, b) => b.value.compareTo(a.value));
 
@@ -612,36 +675,38 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
     sheet.cell(xl.CellIndex.indexByColumnRow(columnIndex: 0, rowIndex: 0))
       ..value = xl.TextCellValue('UID')
       ..cellStyle = h1;
+
     sheet.cell(xl.CellIndex.indexByColumnRow(columnIndex: 1, rowIndex: 0))
       ..value = xl.TextCellValue('Lecturas')
       ..cellStyle = h1;
+
     sheet.cell(xl.CellIndex.indexByColumnRow(columnIndex: 2, rowIndex: 0))
       ..value = xl.TextCellValue('Primera lectura')
       ..cellStyle = h1;
+
     sheet.cell(xl.CellIndex.indexByColumnRow(columnIndex: 3, rowIndex: 0))
       ..value = xl.TextCellValue('Última lectura')
       ..cellStyle = h1;
 
     for (int i = 0; i < sorted.length; i++) {
       final uid = sorted[i].key;
-      final tagsForUid = _tags.where((t) => t.uid == uid).toList();
-      tagsForUid.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+      final tagsForUid = _tags.where((t) => t.uid == uid).toList()
+        ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
 
       sheet
           .cell(xl.CellIndex.indexByColumnRow(columnIndex: 0, rowIndex: i + 1))
-          .value = xl.TextCellValue(
-        uid,
-      );
+          .value = xl.TextCellValue(uid);
+
       sheet
           .cell(xl.CellIndex.indexByColumnRow(columnIndex: 1, rowIndex: i + 1))
-          .value = xl.IntCellValue(
-        sorted[i].value,
-      );
+          .value = xl.IntCellValue(sorted[i].value);
+
       sheet
           .cell(xl.CellIndex.indexByColumnRow(columnIndex: 2, rowIndex: i + 1))
           .value = xl.TextCellValue(
         '${_formatDate(tagsForUid.first.timestamp)} ${_formatTime(tagsForUid.first.timestamp)}',
       );
+
       sheet
           .cell(xl.CellIndex.indexByColumnRow(columnIndex: 3, rowIndex: i + 1))
           .value = xl.TextCellValue(
@@ -664,6 +729,7 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
 
   void _showSnack(String msg, {bool isError = false}) {
     if (!mounted) return;
+
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(
@@ -671,9 +737,8 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
           content: Text(msg),
           backgroundColor: isError ? _C.error : _C.success,
           behavior: SnackBarBehavior.floating,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(10),
-          ),
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
           duration: Duration(seconds: isError ? 4 : 2),
         ),
       );
@@ -688,7 +753,9 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
   Widget build(BuildContext context) {
     return GestureDetector(
       onTap: () {
-        if (_isFabExpanded) setState(() => _isFabExpanded = false);
+        if (_isFabExpanded) {
+          setState(() => _isFabExpanded = false);
+        }
       },
       child: Scaffold(
         backgroundColor: _C.bg,
@@ -735,10 +802,30 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
             tooltip: 'Limpiar lecturas',
             onPressed: _clearTags,
           ),
+        IconButton(
+          icon: const Icon(Icons.playlist_play, color: Colors.white),
+          tooltip: 'START A0',
+          onPressed: (_deviceConnected && _bleReady) ? _sendStartA0 : null,
+        ),
+        IconButton(
+          icon: const Icon(Icons.stop_circle_outlined, color: Colors.white),
+          tooltip: 'STOP A0',
+          onPressed: (_deviceConnected && _bleReady) ? _sendStopA0 : null,
+        ),
+        IconButton(
+          icon: const Icon(Icons.send, color: Colors.white),
+          tooltip: 'START BB',
+          onPressed: (_deviceConnected && _bleReady) ? _sendStartBB : null,
+        ),
+        IconButton(
+          icon: const Icon(Icons.pause_circle_outline, color: Colors.white),
+          tooltip: 'STOP BB',
+          onPressed: (_deviceConnected && _bleReady) ? _sendStopBB : null,
+        ),
         Padding(
           padding: const EdgeInsets.only(right: 8),
           child: TextButton.icon(
-            onPressed: _deviceConnected
+            onPressed: (_deviceConnected && _bleReady)
                 ? (_isListening ? _stopListening : _startListening)
                 : null,
             icon: Icon(
@@ -796,9 +883,8 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
             width: 48,
             height: 48,
             decoration: BoxDecoration(
-              color: (_deviceConnected ? _C.accent : _C.error).withOpacity(
-                0.15,
-              ),
+              color:
+                  (_deviceConnected ? _C.accent : _C.error).withOpacity(0.15),
               shape: BoxShape.circle,
             ),
             child: Icon(
@@ -855,6 +941,15 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
                     fontFamily: 'monospace',
                   ),
                 ),
+                const SizedBox(height: 4),
+                Text(
+                  _bleReady ? 'NUS listo' : 'NUS no listo',
+                  style: TextStyle(
+                    color: _bleReady ? _C.success : _C.warning,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
               ],
             ),
           ),
@@ -891,6 +986,7 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
 
   Widget _buildStatsBar() {
     final uniqueUids = _tags.map((t) => t.uid).toSet().length;
+
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
       child: Row(
@@ -974,6 +1070,7 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
 
   Widget _buildTagTile(RfidTag tag, int index) {
     final isNew = index == 0;
+
     return AnimatedContainer(
       duration: const Duration(milliseconds: 400),
       curve: Curves.easeOut,
@@ -1055,7 +1152,10 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
                       const SizedBox(width: 4),
                       Text(
                         '${_formatDate(tag.timestamp)}  ${_formatTime(tag.timestamp)}',
-                        style: TextStyle(color: _C.textSecondary, fontSize: 11),
+                        style: TextStyle(
+                          color: _C.textSecondary,
+                          fontSize: 11,
+                        ),
                       ),
                     ],
                   ),
@@ -1064,7 +1164,8 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
             ),
             if (isNew)
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
                 decoration: BoxDecoration(
                   color: _C.success.withOpacity(0.15),
                   borderRadius: BorderRadius.circular(6),
@@ -1241,7 +1342,6 @@ class _BleLogsSheet extends StatefulWidget {
 
 class _BleLogsSheetState extends State<_BleLogsSheet> {
   String _filter = 'ALL';
-  bool _autoScroll = true;
   final ScrollController _logScrollCtrl = ScrollController();
 
   @override
@@ -1315,7 +1415,7 @@ class _BleLogsSheetState extends State<_BleLogsSheet> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'Logs BLE (NUS)',
+                        'Logs BLE',
                         style: TextStyle(
                           color: _C.textPrimary,
                           fontSize: 16,
@@ -1413,6 +1513,7 @@ class _BleLogsSheetState extends State<_BleLogsSheet> {
 
   Widget _buildLogEntry(BleLogEntry entry) {
     final dirColor = _directionColor(entry.direction);
+
     return Padding(
       padding: const EdgeInsets.only(bottom: 4),
       child: Container(
@@ -1428,10 +1529,8 @@ class _BleLogsSheetState extends State<_BleLogsSheet> {
             Row(
               children: [
                 Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 5,
-                    vertical: 2,
-                  ),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
                   decoration: BoxDecoration(
                     color: dirColor.withOpacity(0.15),
                     borderRadius: BorderRadius.circular(4),
@@ -1579,12 +1678,13 @@ final headerStyle = xl.CellStyle(
 
 class _Divider extends StatelessWidget {
   const _Divider();
+
   @override
   Widget build(BuildContext context) => Container(
-    margin: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-    height: 1,
-    color: _C.border,
-  );
+        margin: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+        height: 1,
+        color: _C.border,
+      );
 }
 
 class _StatChip extends StatelessWidget {
@@ -1592,6 +1692,7 @@ class _StatChip extends StatelessWidget {
   final String label;
   final String value;
   final Color color;
+
   const _StatChip({
     required this.icon,
     required this.label,
@@ -1643,7 +1744,9 @@ class _StatChip extends StatelessWidget {
 
 class _PulsingDot extends StatefulWidget {
   final Color color;
+
   const _PulsingDot({required this.color});
+
   @override
   State<_PulsingDot> createState() => _PulsingDotState();
 }
@@ -1660,10 +1763,10 @@ class _PulsingDotState extends State<_PulsingDot>
       vsync: this,
       duration: const Duration(milliseconds: 800),
     )..repeat(reverse: true);
-    _anim = Tween<double>(
-      begin: 0.4,
-      end: 1.0,
-    ).animate(CurvedAnimation(parent: _ctrl, curve: Curves.easeInOut));
+
+    _anim = Tween<double>(begin: 0.4, end: 1.0).animate(
+      CurvedAnimation(parent: _ctrl, curve: Curves.easeInOut),
+    );
   }
 
   @override
@@ -1674,31 +1777,19 @@ class _PulsingDotState extends State<_PulsingDot>
 
   @override
   Widget build(BuildContext context) => FadeTransition(
-    opacity: _anim,
-    child: Container(
-      width: 10,
-      height: 10,
-      decoration: BoxDecoration(color: widget.color, shape: BoxShape.circle),
-    ),
-  );
+        opacity: _anim,
+        child: Container(
+          width: 10,
+          height: 10,
+          decoration:
+              BoxDecoration(color: widget.color, shape: BoxShape.circle),
+        ),
+      );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Paleta
 // ─────────────────────────────────────────────────────────────────────────────
-
-abstract class _CDark {
-  static const bg = Color(0xFF0F1117);
-  static const surface = Color(0xFF1A1D27);
-  static const border = Color(0xFF252836);
-  static const accent = Color(0xFF4B9EFF);
-  static const success = Color(0xFF34C97B);
-  static const warning = Color(0xFFFFC947);
-  static const error = Color(0xFFFF5C72);
-  static const export = Color(0xFF22C55E);
-  static const textPrimary = Color(0xFFEEF0F6);
-  static const textSecondary = Color(0xFF7B82A0);
-}
 
 abstract class _C {
   static const bgAppBar = Color(0xFF2563EB);
