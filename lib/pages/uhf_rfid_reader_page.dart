@@ -1,100 +1,177 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:convert';
 import 'dart:developer' as dev;
-import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:excel/excel.dart' as xl;
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 
-// NUS UUIDs
+// ═══════════════════════════════════════════════════════════════════════════════
+// NORDIC UART SERVICE UUIDs
+// El VH-C77P expone NUS sobre BLE. Se escribe al RX y se recibe del TX.
+// ═══════════════════════════════════════════════════════════════════════════════
+
 class NusUuids {
+  /// Nordic UART Service UUID
   static const String service = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+
+  /// RX Characteristic – write data TO the device (WRITE / WRITE_NR)
   static const String rxChar = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+
+  /// TX Characteristic – receive data FROM the device (NOTIFY)
   static const String txChar = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+
+  /// Helper to compare UUIDs ignoring case
   static bool match(String a, String b) => a.toLowerCase() == b.toLowerCase();
 }
 
-// Protocolo UHF (0xBB..0x7E) – Vanch VH-C77P / JRD-4035
-class UhfCmd {
-  static const int H = 0xBB, E = 0x7E;
-  static const int bankEPC = 0x01, bankTID = 0x02, bankUser = 0x03;
+// ═══════════════════════════════════════════════════════════════════════════════
+// PROTOCOLO UHF  0xBB … 0x7E
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Estructura de trama:
+//   Header(1) | Type(1) | Command(1) | PL_MSB(1) | PL_LSB(1) | Payload(PL) | Checksum(1) | End(1)
+//
+// ● Header  = 0xBB
+// ● End     = 0x7E
+// ● Type    = 0x00 (command), 0x01 (response), 0x02 (notification)
+// ● Checksum = suma de bytes desde Type hasta último byte del Payload, & 0xFF
+//
+// Comandos relevantes:
+//   0x22 – Single Inventory   → BB 00 22 00 00 22 7E
+//   0x27 – Multiple Inventory → BB 00 27 00 03 22 FF FF [cs] 7E  (0xFFFF = continuo)
+//   0x28 – Stop Inventory     → BB 00 28 00 00 28 7E
+//   0x39 – Read Memory        → BB 00 39 00 09 [pwd(4)] [bank] [addr(2)] [len(2)] [cs] 7E
+//   0x03 – Get Version        → BB 00 03 00 01 00 04 7E
+//   0xB6 – Set TX Power       → BB 00 B6 00 02 [pwrH] [pwrL] [cs] 7E
+//   0x07 – Set Region         → BB 00 07 00 01 [region] [cs] 7E
+//
+// Respuesta de inventario (notification, type=0x02):
+//   BB 02 22 [PL_MSB] [PL_LSB] [RSSI] [PC(2)] [EPC(var)] [CRC(2)] [cs] 7E
+//   RSSI = complemento a 2 con signo en dBm  (ej: 0xC9 = -55 dBm)
+//
+// Memory banks para cmd 0x39:
+//   0x00 = Reserved, 0x01 = EPC, 0x02 = TID, 0x03 = User
+// ═══════════════════════════════════════════════════════════════════════════════
 
+class UhfCmd {
+  static const int _H = 0xBB, _E = 0x7E;
+
+  // Checksum = sum(Type..Payload) & 0xFF
   static int _cs(List<int> d) {
     int s = 0;
     for (final b in d) s += b;
     return s & 0xFF;
   }
 
-  static List<int> _f(List<int> p) => [H, ...p, _cs(p), E];
+  static List<int> _frame(List<int> body) => [_H, ...body, _cs(body), _E];
 
-  // Inventario
-  static List<int> get singlePoll => _f([0x00, 0x22, 0x00, 0x00]);
-  static List<int> multiPoll([int n = 0xFFFF]) =>
-      _f([0x00, 0x27, 0x00, 0x03, 0x22, (n >> 8) & 0xFF, n & 0xFF]);
-  static List<int> get stopPoll => _f([0x00, 0x28, 0x00, 0x00]);
+  // ── Inventario ─────────────────────────────────────────────────────────
+  /// Inventario único (una sola ronda, cmd 0x22)
+  static List<int> get singleInventory => _frame([0x00, 0x22, 0x00, 0x00]);
 
-  // Leer memoria  bank: TID=0x02, User=0x03  startWord, wordCount
-  static List<int> readMem(
-    int bank, {
-    int start = 0,
-    int words = 6,
-    int pwd = 0,
-  }) => _f([
-    0x00,
-    0x39,
-    0x00,
-    0x09,
-    (pwd >> 24) & 0xFF,
-    (pwd >> 16) & 0xFF,
-    (pwd >> 8) & 0xFF,
-    pwd & 0xFF,
-    bank,
-    (start >> 8) & 0xFF,
-    start & 0xFF,
-    (words >> 8) & 0xFF,
-    words & 0xFF,
-  ]);
+  /// Inventario múltiple continuo (cmd 0x27, count=0xFFFF = hasta STOP)
+  static List<int> startInventory({int count = 0xFFFF}) {
+    return _frame([
+      0x00,
+      0x27,
+      0x00,
+      0x03,
+      0x22,
+      (count >> 8) & 0xFF,
+      count & 0xFF,
+    ]);
+  }
 
-  static List<int> readTID({int w = 6}) => readMem(bankTID, words: w);
-  static List<int> readUser({int w = 4}) => readMem(bankUser, words: w);
+  /// Detener inventario múltiple (cmd 0x28)
+  static List<int> get stopInventory => _frame([0x00, 0x28, 0x00, 0x00]);
 
-  // Config
-  static List<int> get version => _f([0x00, 0x03, 0x00, 0x01, 0x00]);
-  static List<int> setPower(int cdBm) =>
-      _f([0x00, 0xB6, 0x00, 0x02, (cdBm >> 8) & 0xFF, cdBm & 0xFF]);
-  static List<int> setRegion(int r) => _f([0x00, 0x07, 0x00, 0x01, r]);
+  // ── Lectura de memoria ─────────────────────────────────────────────────
+  /// Lee memoria del tag (cmd 0x39). bank: 0x02=TID, 0x03=User
+  /// startWord y wordCount en WORDS (1 word = 2 bytes)
+  static List<int> readMemory({
+    required int bank,
+    int startWord = 0,
+    int wordCount = 6,
+    int password = 0,
+  }) {
+    return _frame([
+      0x00,
+      0x39,
+      0x00,
+      0x09,
+      (password >> 24) & 0xFF,
+      (password >> 16) & 0xFF,
+      (password >> 8) & 0xFF,
+      password & 0xFF,
+      bank,
+      (startWord >> 8) & 0xFF,
+      startWord & 0xFF,
+      (wordCount >> 8) & 0xFF,
+      wordCount & 0xFF,
+    ]);
+  }
 
-  // Parser
-  static UhfFrame? parse(List<int> f) {
-    if (f.length < 7 || f.first != H || f.last != E) return null;
-    final pl = (f[3] << 8) | f[4];
-    if (f.length < 5 + pl + 2) return null;
-    final cs = _cs(f.sublist(1, 5 + pl));
-    if (cs != f[5 + pl]) return null;
-    return UhfFrame(type: f[1], cmd: f[2], payload: f.sublist(5, 5 + pl));
+  static List<int> readTID({int words = 6}) =>
+      readMemory(bank: 0x02, wordCount: words);
+
+  static List<int> readUserData({int words = 4}) =>
+      readMemory(bank: 0x03, wordCount: words);
+
+  // ── Configuración ──────────────────────────────────────────────────────
+  static List<int> get getVersion => _frame([0x00, 0x03, 0x00, 0x01, 0x00]);
+
+  /// power en centésimas de dBm: 2600 = 26.00 dBm
+  static List<int> setTxPower(int cdBm) =>
+      _frame([0x00, 0xB6, 0x00, 0x02, (cdBm >> 8) & 0xFF, cdBm & 0xFF]);
+
+  /// 0x01=China, 0x02=USA, 0x03=EU, 0x04=Korea
+  static List<int> setRegion(int region) =>
+      _frame([0x00, 0x07, 0x00, 0x01, region]);
+
+  // ── Parser ─────────────────────────────────────────────────────────────
+  static _UhfFrame? parse(List<int> raw) {
+    if (raw.length < 7 || raw.first != _H || raw.last != _E) return null;
+    final pl = (raw[3] << 8) | raw[4];
+    final need = 5 + pl + 2; // header..PL + payload + cs + end
+    if (raw.length < need) return null;
+    final cs = _cs(raw.sublist(1, 5 + pl));
+    if (cs != raw[5 + pl]) return null;
+    return _UhfFrame(
+      type: raw[1],
+      cmd: raw[2],
+      payload: raw.sublist(5, 5 + pl),
+    );
   }
 }
 
-class UhfFrame {
+class _UhfFrame {
   final int type, cmd;
   final List<int> payload;
-  UhfFrame({required this.type, required this.cmd, required this.payload});
-  bool get isNotify => type == 0x02;
-  bool get isResp => type == 0x01;
-  bool get isInv => cmd == 0x22 || cmd == 0x27;
-  bool get isRead => cmd == 0x39;
-  bool get isErr => type == 0x01 && cmd == 0xFF;
+  _UhfFrame({required this.type, required this.cmd, required this.payload});
+
+  bool get isNotification => type == 0x02;
+  bool get isResponse => type == 0x01;
+  bool get isInventory => cmd == 0x22 || cmd == 0x27;
+  bool get isReadData => cmd == 0x39;
+  bool get isError => type == 0x01 && cmd == 0xFF;
 }
 
-// Modelo tag UHF
+// ═══════════════════════════════════════════════════════════════════════════════
+// MODELO – Etiqueta UHF
+// ═══════════════════════════════════════════════════════════════════════════════
+
 class UhfTag {
-  final String epc, pc, crc, raw;
+  final String epc;
+  final String pc;
   final int rssi;
+  final String crc;
   final DateTime timestamp;
-  String tid, userData;
+  final String rawHex;
+  String tid;
+  String userData;
+  int readCount;
 
   UhfTag({
     required this.epc,
@@ -102,81 +179,95 @@ class UhfTag {
     required this.rssi,
     required this.crc,
     required this.timestamp,
-    required this.raw,
+    required this.rawHex,
     this.tid = '',
     this.userData = '',
+    this.readCount = 1,
   });
 
-  static UhfTag? fromInv(UhfFrame f) {
-    if (!f.isInv) return null;
+  /// Parsea la notificación de inventario (type=0x02, cmd=0x22 o 0x27)
+  /// Payload: [RSSI(1)] [PC(2)] [EPC(variable)] [CRC(2)]
+  static UhfTag? fromInventory(_UhfFrame f) {
+    if (!f.isInventory) return null;
     final p = f.payload;
     if (p.length < 6) return null;
-    final r = p[0];
-    final rssi = r > 127 ? r - 256 : r;
-    String hx(List<int> b) => b
-        .map((x) => x.toRadixString(16).padLeft(2, '0'))
-        .join('')
+
+    final rssiRaw = p[0];
+    final rssi = rssiRaw > 127 ? rssiRaw - 256 : rssiRaw;
+    final pc = _hex(p.sublist(1, 3));
+    final epc = _hex(p.sublist(3, p.length - 2));
+    final crc = _hex(p.sublist(p.length - 2));
+    final raw = p
+        .map((b) => b.toRadixString(16).padLeft(2, '0'))
+        .join(' ')
         .toUpperCase();
+
     return UhfTag(
-      epc: hx(p.sublist(3, p.length - 2)),
-      pc: hx(p.sublist(1, 3)),
+      epc: epc,
+      pc: pc,
       rssi: rssi,
-      crc: hx(p.sublist(p.length - 2)),
+      crc: crc,
       timestamp: DateTime.now(),
-      raw: p
-          .map((x) => x.toRadixString(16).padLeft(2, '0'))
-          .join(' ')
-          .toUpperCase(),
+      rawHex: raw,
     );
   }
+
+  static String _hex(List<int> b) =>
+      b.map((x) => x.toRadixString(16).padLeft(2, '0')).join('').toUpperCase();
 }
 
-class BleLogEntry {
-  final DateTime timestamp;
-  final String direction, description, rawHex;
-  final int byteCount;
-  BleLogEntry({
-    required this.timestamp,
-    required this.direction,
-    required this.description,
-    required this.rawHex,
-    required this.byteCount,
-  });
+// ═══════════════════════════════════════════════════════════════════════════════
+// MODELO – Log BLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+class _LogEntry {
+  final DateTime ts;
+  final String dir; // TX, RX, SYS
+  final String desc;
+  final String hex;
+  final int bytes;
+  _LogEntry(this.ts, this.dir, this.desc, {this.hex = '', this.bytes = 0});
 }
 
-// ─── Page ──────────────────────────────────────────────────────────────────
-class UhfRfidReaderPage extends StatefulWidget {
+// ═══════════════════════════════════════════════════════════════════════════════
+// PANTALLA PRINCIPAL – UhcRfidReaderScanPage
+// ═══════════════════════════════════════════════════════════════════════════════
+
+class UhcRfidReaderScanPage extends StatefulWidget {
   final BluetoothDevice device;
-  const UhfRfidReaderPage({super.key, required this.device});
+  const UhcRfidReaderScanPage({super.key, required this.device});
+
   @override
-  State<UhfRfidReaderPage> createState() => _UhfRfidReaderPageState();
+  State<UhcRfidReaderScanPage> createState() => _UhcRfidReaderScanPageState();
 }
 
-class _UhfRfidReaderPageState extends State<UhfRfidReaderPage> {
-  final List<UhfTag> _tags = [];
-  final Map<String, UhfTag> _unique = {};
-  final List<BleLogEntry> _logs = [];
-  final ScrollController _scroll = ScrollController();
-  final List<int> _rxBuf = [];
+class _UhcRfidReaderScanPageState extends State<UhcRfidReaderScanPage> {
+  // ── Listas de datos ────────────────────────────────────────────────────
+  final List<UhfTag> _allTags = []; // cada lectura individual
+  final Map<String, UhfTag> _unique = {}; // EPC → tag más reciente
+  final List<_LogEntry> _logs = [];
 
-  bool _listening = false,
-      _exporting = false,
-      _fabOpen = false,
-      _readingExtra = false,
-      _connected = true;
-  BluetoothCharacteristic? _txChr, _rxChr;
+  // ── BLE ────────────────────────────────────────────────────────────────
+  BluetoothCharacteristic? _txChar; // NOTIFY – recibe datos
+  BluetoothCharacteristic? _rxChar; // WRITE  – envía comandos
   StreamSubscription<List<int>>? _notifySub;
   StreamSubscription<BluetoothConnectionState>? _connSub;
+  bool _connected = true;
 
-  // Read-extra state
-  final List<String> _pendingReads = [];
-  String? _curReadEpc;
-  int _readPhase = 0; // 0=idle 1=TID 2=User
+  // ── Estado UI ──────────────────────────────────────────────────────────
+  bool _scanning = false;
+  bool _exporting = false;
+  bool _fabOpen = false;
+  final ScrollController _scroll = ScrollController();
 
+  // ── Buffer de recepción ────────────────────────────────────────────────
+  final List<int> _rxBuf = [];
+
+  // ── Lifecycle ──────────────────────────────────────────────────────────
   @override
   void initState() {
     super.initState();
-    _watchConn();
+    _watchConnection();
     _discover();
   }
 
@@ -188,31 +279,29 @@ class _UhfRfidReaderPageState extends State<UhfRfidReaderPage> {
     super.dispose();
   }
 
-  void _log(String dir, String desc, {String hex = '', int bc = 0}) {
+  // ═════════════════════════════════════════════════════════════════════════
+  // CONEXIÓN BLE
+  // ═════════════════════════════════════════════════════════════════════════
+
+  void _addLog(String dir, String desc, {String hex = '', int bc = 0}) {
     if (!mounted) return;
     setState(
       () => _logs.insert(
         0,
-        BleLogEntry(
-          timestamp: DateTime.now(),
-          direction: dir,
-          description: desc,
-          rawHex: hex,
-          byteCount: bc,
-        ),
+        _LogEntry(DateTime.now(), dir, desc, hex: hex, bytes: bc),
       ),
     );
   }
 
-  void _watchConn() {
+  void _watchConnection() {
     _connSub = widget.device.connectionState.listen((s) {
       if (!mounted) return;
-      final c = s == BluetoothConnectionState.connected;
-      setState(() => _connected = c);
-      _log('SYS', c ? 'Conectado' : 'Desconectado');
-      if (s == BluetoothConnectionState.disconnected) {
+      final ok = s == BluetoothConnectionState.connected;
+      setState(() => _connected = ok);
+      _addLog('SYS', ok ? 'Dispositivo conectado' : 'Dispositivo desconectado');
+      if (!ok) {
         _notifySub?.cancel();
-        setState(() => _listening = false);
+        setState(() => _scanning = false);
         _snack('Desconectado', err: true);
       }
     });
@@ -220,235 +309,294 @@ class _UhfRfidReaderPageState extends State<UhfRfidReaderPage> {
 
   Future<void> _discover() async {
     try {
-      _log('TX', 'Descubriendo servicios...');
-      final svcs = await widget.device.discoverServices();
-      _log('RX', '${svcs.length} servicios');
-      for (final s in svcs)
-        for (final c in s.characteristics) {
-          final p = <String>[];
-          if (c.properties.read) p.add('R');
-          if (c.properties.write) p.add('W');
-          if (c.properties.notify) p.add('N');
-          _log('RX', '  ${c.uuid.toString().toUpperCase()} [${p.join(",")}]');
+      _addLog('SYS', 'Descubriendo servicios GATT…');
+      final services = await widget.device.discoverServices();
+      _addLog('RX', '${services.length} servicios encontrados');
+
+      // Log de todos los servicios y características
+      for (final svc in services) {
+        for (final c in svc.characteristics) {
+          final props = <String>[];
+          if (c.properties.read) props.add('R');
+          if (c.properties.write) props.add('W');
+          if (c.properties.writeWithoutResponse) props.add('WNR');
+          if (c.properties.notify) props.add('N');
+          if (c.properties.indicate) props.add('I');
+          _addLog(
+            'RX',
+            'Svc ${svc.uuid.toString().toUpperCase()} → ${c.uuid.toString().toUpperCase()} [${props.join(",")}]',
+          );
         }
-      BluetoothService? nus;
-      for (final s in svcs)
+      }
+
+      // ─── Validar conexión exclusiva con NUS ─────────────────────────────
+      // Solo se conecta al servicio 6E400001 (Nordic UART Service).
+      // Si el dispositivo no expone NUS, se rechaza la conexión.
+      BluetoothService? nusService;
+      for (final s in services) {
         if (NusUuids.match(s.uuid.toString(), NusUuids.service)) {
-          nus = s;
+          nusService = s;
           break;
         }
-      if (nus == null) {
-        _log('SYS', '⚠ NUS no encontrado');
-        _snack('NUS no encontrado', err: true);
+      }
+      if (nusService == null) {
+        _addLog(
+          'SYS',
+          '⚠ Nordic UART Service (${NusUuids.service.toUpperCase()}) NO encontrado',
+        );
+        _addLog('SYS', '⚠ Este dispositivo no es compatible — se requiere NUS');
+        _snack('NUS no encontrado. Dispositivo no compatible.', err: true);
         return;
       }
-      for (final c in nus.characteristics) {
-        if (NusUuids.match(c.uuid.toString(), NusUuids.txChar))
-          _txChr = c;
-        else if (NusUuids.match(c.uuid.toString(), NusUuids.rxChar))
-          _rxChr = c;
-      }
-      if (_txChr == null) {
-        _log('SYS', '⚠ TX char no encontrada');
-        return;
-      }
-      _log('SYS', 'NUS listo ✓ TX=${_txChr != null} RX=${_rxChr != null}');
-      await _txChr!.setNotifyValue(true);
-      _notifySub = _txChr!.onValueReceived.listen(
-        _onBytes,
-        onError: (e) => _log('SYS', '✖ $e'),
+
+      _addLog(
+        'SYS',
+        'Nordic UART Service encontrado ✓ (${nusService.characteristics.length} características)',
       );
-      _log('SYS', 'Notify activado ✓');
+
+      // ─── Buscar características TX (NOTIFY) y RX (WRITE) dentro del NUS ─
+      // TX = 6E400003 → el lector envía datos aquí (NOTIFY)
+      // RX = 6E400002 → la app escribe comandos aquí (WRITE)
+      for (final c in nusService.characteristics) {
+        final uuid = c.uuid.toString();
+        if (NusUuids.match(uuid, NusUuids.txChar)) {
+          _txChar = c;
+          _addLog(
+            'SYS',
+            'TX Char (NOTIFY) encontrada ✓ ${c.uuid.toString().toUpperCase()}',
+          );
+        } else if (NusUuids.match(uuid, NusUuids.rxChar)) {
+          _rxChar = c;
+          _addLog(
+            'SYS',
+            'RX Char (WRITE) encontrada ✓ ${c.uuid.toString().toUpperCase()}',
+          );
+        }
+      }
+
+      if (_txChar == null) {
+        _addLog(
+          'SYS',
+          '⚠ TX Characteristic (${NusUuids.txChar.toUpperCase()}) no encontrada en NUS',
+        );
+        _snack('Característica TX (NOTIFY) no encontrada', err: true);
+        return;
+      }
+      if (_rxChar == null) {
+        _addLog(
+          'SYS',
+          '⚠ RX Characteristic (${NusUuids.rxChar.toUpperCase()}) no encontrada en NUS',
+        );
+        _snack('Característica RX (WRITE) no encontrada', err: true);
+        return;
+      }
+
+      _addLog('SYS', 'NUS encontrado ✓  TX(NOTIFY) ✓  RX(WRITE) ✓');
+
+      // Activar notificaciones
+      await _txChar!.setNotifyValue(true);
+      _notifySub = _txChar!.onValueReceived.listen(
+        _onBytesReceived,
+        onError: (e) => _addLog('SYS', '✖ Error NOTIFY: $e'),
+      );
+      _addLog('SYS', 'Notificaciones activadas ✓ — Listo para inventario');
     } catch (e) {
-      _log('SYS', '✖ $e');
+      _addLog('SYS', '✖ Error descubrimiento: $e');
       _snack('Error: $e', err: true);
     }
   }
 
-  Future<void> _send(List<int> b, String label) async {
-    if (_rxChr == null) {
-      _log('SYS', '⚠ Sin RX char');
+  // ═════════════════════════════════════════════════════════════════════════
+  // ENVIAR COMANDO AL LECTOR
+  // ═════════════════════════════════════════════════════════════════════════
+
+  Future<void> _send(List<int> cmd, String label) async {
+    if (_rxChar == null) {
+      _addLog('SYS', '⚠ Característica RX no disponible');
       return;
     }
-    final h = b
-        .map((x) => x.toRadixString(16).padLeft(2, '0'))
+    final hex = cmd
+        .map((b) => b.toRadixString(16).padLeft(2, '0'))
         .join(' ')
         .toUpperCase();
-    _log('TX', '$label (${b.length}B)', hex: h, bc: b.length);
+    _addLog('TX', '$label (${cmd.length}B)', hex: hex, bc: cmd.length);
     try {
-      await _rxChr!.write(
-        b,
-        withoutResponse: _rxChr!.properties.writeWithoutResponse,
+      await _rxChar!.write(
+        cmd,
+        withoutResponse: _rxChar!.properties.writeWithoutResponse,
       );
     } catch (e) {
-      _log('SYS', '✖ Envío: $e');
+      _addLog('SYS', '✖ Error de envío: $e');
+      _snack('Error al enviar: $e', err: true);
     }
   }
 
-  void _onBytes(List<int> bytes) {
+  // ═════════════════════════════════════════════════════════════════════════
+  // RECEPCIÓN Y ENSAMBLAJE DE FRAMES
+  // ═════════════════════════════════════════════════════════════════════════
+
+  void _onBytesReceived(List<int> bytes) {
     if (bytes.isEmpty || !mounted) return;
-    _log(
-      'RX',
-      '${bytes.length}B',
-      hex: bytes
-          .map((x) => x.toRadixString(16).padLeft(2, '0'))
-          .join(' ')
-          .toUpperCase(),
-      bc: bytes.length,
-    );
+
+    final hex = bytes
+        .map((b) => b.toRadixString(16).padLeft(2, '0'))
+        .join(' ')
+        .toUpperCase();
+    _addLog('RX', '${bytes.length}B recibidos', hex: hex, bc: bytes.length);
+
     _rxBuf.addAll(bytes);
+
+    // Extraer frames completos del buffer
     while (_rxBuf.length >= 7) {
-      final si = _rxBuf.indexOf(0xBB);
-      if (si < 0) {
+      // Buscar header 0xBB
+      final start = _rxBuf.indexOf(0xBB);
+      if (start < 0) {
         _rxBuf.clear();
         break;
       }
-      if (si > 0) _rxBuf.removeRange(0, si);
+      if (start > 0) _rxBuf.removeRange(0, start);
       if (_rxBuf.length < 7) break;
-      final pl = (_rxBuf[3] << 8) | _rxBuf[4], total = 5 + pl + 2;
-      if (_rxBuf.length < total) break;
-      if (_rxBuf[total - 1] != 0x7E) {
-        _rxBuf.removeAt(0);
+
+      // Calcular longitud total del frame
+      final plLen = (_rxBuf[3] << 8) | _rxBuf[4];
+      final frameLen =
+          1 +
+          1 +
+          1 +
+          2 +
+          plLen +
+          1 +
+          1; // H + Type + Cmd + PL(2) + payload + CS + E
+
+      if (_rxBuf.length < frameLen) break; // Esperar más bytes
+
+      // Verificar byte End
+      if (_rxBuf[frameLen - 1] != 0x7E) {
+        _rxBuf.removeAt(0); // Corrupto, saltar
         continue;
       }
-      final fb = _rxBuf.sublist(0, total);
-      _rxBuf.removeRange(0, total);
-      final frame = UhfCmd.parse(fb);
-      if (frame != null)
-        _handleFrame(frame);
-      else
-        _log('SYS', '⚠ Checksum error');
+
+      // Extraer y parsear
+      final raw = _rxBuf.sublist(0, frameLen);
+      _rxBuf.removeRange(0, frameLen);
+
+      final frame = UhfCmd.parse(raw);
+      if (frame != null) {
+        _processFrame(frame);
+      } else {
+        _addLog('SYS', '⚠ Frame con checksum inválido');
+      }
     }
   }
 
-  void _handleFrame(UhfFrame f) {
-    // Inventario
-    if (f.isNotify && f.isInv) {
-      final tag = UhfTag.fromInv(f);
-      if (tag != null) {
-        setState(() {
-          _tags.insert(0, tag);
+  // ═════════════════════════════════════════════════════════════════════════
+  // PROCESAR FRAMES DEL LECTOR
+  // ═════════════════════════════════════════════════════════════════════════
+
+  void _processFrame(_UhfFrame f) {
+    // ── Notificación de inventario ───────────────────────────────────────
+    if (f.isNotification && f.isInventory) {
+      final tag = UhfTag.fromInventory(f);
+      if (tag == null) return;
+
+      setState(() {
+        _allTags.insert(0, tag);
+        if (_unique.containsKey(tag.epc)) {
+          _unique[tag.epc]!.readCount++;
+          _unique[tag.epc]!.tid = _unique[tag.epc]!.tid; // preservar TID previo
+        } else {
           _unique[tag.epc] = tag;
-        });
-        _log('SYS', '📦 EPC:${tag.epc} RSSI:${tag.rssi}dBm');
-        _autoScroll();
-      }
+        }
+      });
+
+      _addLog('SYS', '📦 EPC: ${tag.epc}  RSSI: ${tag.rssi} dBm');
+      _autoScroll();
       return;
     }
-    // Read data response
-    if (f.isResp && f.isRead) {
+
+    // ── Respuesta Read Data ──────────────────────────────────────────────
+    if (f.isResponse && f.isReadData) {
       final data = f.payload
-          .map((x) => x.toRadixString(16).padLeft(2, '0'))
+          .map((b) => b.toRadixString(16).padLeft(2, '0'))
           .join('')
           .toUpperCase();
-      if (_readPhase == 1 && _curReadEpc != null) {
-        final t = _unique[_curReadEpc];
-        if (t != null) setState(() => t.tid = data);
-        _log('SYS', '🏷️ TID:$data');
-        _readPhase = 2;
-        _send(UhfCmd.readUser(w: 4), 'Read User');
-      } else if (_readPhase == 2 && _curReadEpc != null) {
-        final t = _unique[_curReadEpc];
-        if (t != null) setState(() => t.userData = data);
-        _log('SYS', '👤 User:$data');
-        _readPhase = 0;
-        _curReadEpc = null;
-        _readingExtra = false;
-        _nextPendingRead();
-      }
+      _addLog('SYS', '📖 Datos leídos: $data');
       return;
     }
-    // Error
-    if (f.isErr) {
-      final ec = f.payload.isNotEmpty ? f.payload[0] : -1;
-      _log('SYS', '⚠ Error 0x${ec.toRadixString(16)} fase=$_readPhase');
-      if (_readPhase == 1) {
-        _readPhase = 2;
-        _send(UhfCmd.readUser(w: 4), 'Read User');
-      } else if (_readPhase == 2) {
-        _readPhase = 0;
-        _curReadEpc = null;
-        _readingExtra = false;
-        _nextPendingRead();
-      }
+
+    // ── Error ────────────────────────────────────────────────────────────
+    if (f.isError) {
+      final code = f.payload.isNotEmpty ? f.payload[0] : 0;
+      final msg = code == 0x15
+          ? 'Sin tag / CRC error'
+          : 'Error 0x${code.toRadixString(16).toUpperCase()}';
+      _addLog('SYS', '⚠ $msg');
       return;
     }
-    // Fin multi-inventario
-    if (f.isResp && f.cmd == 0x27) {
-      _log('SYS', 'Inventario fin (${_tags.length} tags)');
+
+    // ── Fin de inventario múltiple ───────────────────────────────────────
+    if (f.isResponse && f.cmd == 0x27) {
+      _addLog(
+        'SYS',
+        'Inventario completado (${_allTags.length} lecturas, ${_unique.length} únicos)',
+      );
       return;
     }
-    _log(
+
+    // ── Otras respuestas ─────────────────────────────────────────────────
+    _addLog(
       'SYS',
-      'Frame t=0x${f.type.toRadixString(16)} c=0x${f.cmd.toRadixString(16)}',
+      'Frame: type=0x${f.type.toRadixString(16)} cmd=0x${f.cmd.toRadixString(16)} pl=${f.payload.length}B',
     );
   }
 
-  void _nextPendingRead() {
-    if (_pendingReads.isEmpty) {
-      _readingExtra = false;
-      return;
-    }
-    _curReadEpc = _pendingReads.removeAt(0);
-    _readPhase = 1;
-    _readingExtra = true;
-    _send(UhfCmd.readTID(w: 6), 'Read TID');
-  }
+  // ═════════════════════════════════════════════════════════════════════════
+  // ACCIONES DE INVENTARIO
+  // ═════════════════════════════════════════════════════════════════════════
 
-  void _readAllExtra() {
-    final p = _unique.entries
-        .where((e) => e.value.tid.isEmpty)
-        .map((e) => e.key)
-        .toList();
-    if (p.isEmpty) {
-      _snack('Todos los tags ya tienen TID');
-      return;
-    }
-    _pendingReads.addAll(p);
-    _log('SYS', 'Leyendo TID+User para ${p.length} tags...');
-    _nextPendingRead();
-  }
-
-  Future<void> _startScan() async {
+  Future<void> _startInventory() async {
     _rxBuf.clear();
-    await _send(UhfCmd.multiPoll(), 'Start Inventario');
-    if (mounted) setState(() => _listening = true);
+    await _send(
+      UhfCmd.startInventory(),
+      'Iniciar inventario continuo (cmd 0x27)',
+    );
+    if (mounted) setState(() => _scanning = true);
   }
 
-  Future<void> _stopScan() async {
-    await _send(UhfCmd.stopPoll, 'Stop Inventario');
-    await Future.delayed(const Duration(milliseconds: 200));
-    if (mounted) setState(() => _listening = false);
+  Future<void> _stopInventory() async {
+    await _send(UhfCmd.stopInventory, 'Detener inventario (cmd 0x28)');
+    await Future.delayed(const Duration(milliseconds: 300));
+    if (mounted) setState(() => _scanning = false);
   }
 
-  void _clearTags() {
+  void _clearAll() {
     showDialog(
       context: context,
       builder: (_) => AlertDialog(
-        backgroundColor: _C.surface,
+        backgroundColor: _K.surface,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
         title: Text(
           'Limpiar lecturas',
-          style: TextStyle(color: _C.textPrimary, fontWeight: FontWeight.w700),
+          style: TextStyle(color: _K.textPrimary, fontWeight: FontWeight.w700),
         ),
         content: Text(
-          '¿Eliminar ${_tags.length} lecturas?',
-          style: TextStyle(color: _C.textSecondary),
+          '¿Eliminar ${_allTags.length} lecturas y ${_unique.length} tags únicos?',
+          style: TextStyle(color: _K.textSec),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context),
-            child: Text('Cancelar', style: TextStyle(color: _C.textSecondary)),
+            child: Text('Cancelar', style: TextStyle(color: _K.textSec)),
           ),
           TextButton(
             onPressed: () {
               setState(() {
-                _tags.clear();
+                _allTags.clear();
                 _unique.clear();
               });
               Navigator.pop(context);
             },
-            child: Text('Limpiar', style: TextStyle(color: _C.error)),
+            child: Text('Limpiar', style: TextStyle(color: _K.error)),
           ),
         ],
       ),
@@ -457,14 +605,19 @@ class _UhfRfidReaderPageState extends State<UhfRfidReaderPage> {
 
   void _autoScroll() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scroll.hasClients)
+      if (_scroll.hasClients) {
         _scroll.animateTo(
           0,
           duration: const Duration(milliseconds: 300),
           curve: Curves.easeOut,
         );
+      }
     });
   }
+
+  // ═════════════════════════════════════════════════════════════════════════
+  // LOGS – BOTTOM SHEET
+  // ═════════════════════════════════════════════════════════════════════════
 
   void _showLogs() {
     setState(() => _fabOpen = false);
@@ -472,81 +625,138 @@ class _UhfRfidReaderPageState extends State<UhfRfidReaderPage> {
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      builder: (_) => _BleLogsSheet(
+      builder: (_) => _LogsSheet(
         logs: _logs,
         onClear: () {
           setState(() => _logs.clear());
           Navigator.pop(context);
           _snack('Logs limpiados');
         },
-        formatTime: _fmtT,
-        formatDate: _fmtD,
       ),
     );
   }
 
-  Future<void> _export() async {
+  // ═════════════════════════════════════════════════════════════════════════
+  // EXPORTAR A EXCEL
+  // ═════════════════════════════════════════════════════════════════════════
+
+  Future<void> _exportExcel() async {
     setState(() => _fabOpen = false);
-    if (_tags.isEmpty) {
-      _snack('Sin datos', err: true);
+    if (_unique.isEmpty) {
+      _snack('No hay tags para exportar', err: true);
       return;
     }
     setState(() => _exporting = true);
+
     try {
-      final ex = xl.Excel.createExcel();
-      final sh = ex['Lecturas UHF'];
-      ex.delete('Sheet1');
-      final hs = [
+      final workbook = xl.Excel.createExcel();
+
+      // ── Hoja "Inventario" ──────────────────────────────────────────────
+      final sheet = workbook['Inventario UHF'];
+      workbook.delete('Sheet1');
+
+      final headers = [
         '#',
         'EPC',
-        'TID',
-        'User Data',
-        'RSSI',
+        'RSSI (dBm)',
         'PC',
-        'Fecha',
-        'Hora',
-        'Raw',
+        'Lecturas',
+        'Primera vez',
+        'Raw HEX',
       ];
-      for (int c = 0; c < hs.length; c++) {
-        final cell = sh.cell(
-          xl.CellIndex.indexByColumnRow(columnIndex: c, rowIndex: 0),
-        );
-        cell.value = xl.TextCellValue(hs[c]);
-        cell.cellStyle = _hdrStyle;
+      for (int c = 0; c < headers.length; c++) {
+        sheet.cell(xl.CellIndex.indexByColumnRow(columnIndex: c, rowIndex: 0))
+          ..value = xl.TextCellValue(headers[c])
+          ..cellStyle = _xlHeader;
       }
-      for (int i = 0; i < _tags.length; i++) {
-        final t = _tags[i];
-        final r = i + 1;
-        final rd = [
-          xl.IntCellValue(_tags.length - i),
+
+      final sorted = _unique.values.toList()
+        ..sort((a, b) => b.readCount.compareTo(a.readCount));
+
+      for (int i = 0; i < sorted.length; i++) {
+        final t = sorted[i];
+        final row = i + 1;
+        final even = row % 2 == 0;
+        final style = even ? _xlEven : _xlOdd;
+
+        final cells = [
+          xl.IntCellValue(row),
           xl.TextCellValue(t.epc),
-          xl.TextCellValue(t.tid.isNotEmpty ? t.tid : '—'),
-          xl.TextCellValue(t.userData.isNotEmpty ? t.userData : '—'),
           xl.IntCellValue(t.rssi),
           xl.TextCellValue(t.pc),
-          xl.TextCellValue(_fmtD(t.timestamp)),
-          xl.TextCellValue(_fmtT(t.timestamp)),
-          xl.TextCellValue(t.raw),
+          xl.IntCellValue(t.readCount),
+          xl.TextCellValue('${_fmtDate(t.timestamp)} ${_fmtTime(t.timestamp)}'),
+          xl.TextCellValue(t.rawHex),
         ];
-        for (int c = 0; c < rd.length; c++)
-          sh
-                  .cell(
-                    xl.CellIndex.indexByColumnRow(columnIndex: c, rowIndex: r),
-                  )
-                  .value =
-              rd[c];
+
+        for (int c = 0; c < cells.length; c++) {
+          sheet.cell(
+              xl.CellIndex.indexByColumnRow(columnIndex: c, rowIndex: row),
+            )
+            ..value = cells[c]
+            ..cellStyle = style;
+        }
       }
-      sh.setColumnWidth(1, 36);
-      sh.setColumnWidth(2, 28);
-      sh.setColumnWidth(3, 28);
-      sh.setColumnWidth(8, 52);
-      final bytes = ex.encode();
-      if (bytes == null) throw Exception('Encode error');
+
+      sheet.setColumnWidth(0, 6);
+      sheet.setColumnWidth(1, 36);
+      sheet.setColumnWidth(2, 12);
+      sheet.setColumnWidth(3, 10);
+      sheet.setColumnWidth(4, 10);
+      sheet.setColumnWidth(5, 22);
+      sheet.setColumnWidth(6, 52);
+
+      // ── Hoja "Todas las lecturas" ──────────────────────────────────────
+      final allSheet = workbook['Todas las lecturas'];
+      final allHeaders = ['#', 'EPC', 'RSSI', 'Fecha', 'Hora'];
+      for (int c = 0; c < allHeaders.length; c++) {
+        allSheet.cell(
+            xl.CellIndex.indexByColumnRow(columnIndex: c, rowIndex: 0),
+          )
+          ..value = xl.TextCellValue(allHeaders[c])
+          ..cellStyle = _xlHeader;
+      }
+      for (int i = 0; i < _allTags.length; i++) {
+        final t = _allTags[i];
+        final row = i + 1;
+        allSheet
+            .cell(xl.CellIndex.indexByColumnRow(columnIndex: 0, rowIndex: row))
+            .value = xl.IntCellValue(
+          row,
+        );
+        allSheet
+            .cell(xl.CellIndex.indexByColumnRow(columnIndex: 1, rowIndex: row))
+            .value = xl.TextCellValue(
+          t.epc,
+        );
+        allSheet
+            .cell(xl.CellIndex.indexByColumnRow(columnIndex: 2, rowIndex: row))
+            .value = xl.IntCellValue(
+          t.rssi,
+        );
+        allSheet
+            .cell(xl.CellIndex.indexByColumnRow(columnIndex: 3, rowIndex: row))
+            .value = xl.TextCellValue(
+          _fmtDate(t.timestamp),
+        );
+        allSheet
+            .cell(xl.CellIndex.indexByColumnRow(columnIndex: 4, rowIndex: row))
+            .value = xl.TextCellValue(
+          _fmtTime(t.timestamp),
+        );
+      }
+      allSheet.setColumnWidth(1, 36);
+
+      // ── Guardar y compartir ────────────────────────────────────────────
+      final bytes = workbook.encode();
+      if (bytes == null) throw Exception('Error al codificar Excel');
+
       final dir = await getTemporaryDirectory();
       final file = File(
-        '${dir.path}/uhf_${DateTime.now().millisecondsSinceEpoch}.xlsx',
+        '${dir.path}/inventario_uhf_${DateTime.now().millisecondsSinceEpoch}.xlsx',
       );
       await file.writeAsBytes(bytes);
+
       await Share.shareXFiles(
         [
           XFile(
@@ -555,28 +765,34 @@ class _UhfRfidReaderPageState extends State<UhfRfidReaderPage> {
                 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
           ),
         ],
-        subject: 'UHF RFID — ${_fmtD(DateTime.now())}',
-        text: '${_tags.length} tags',
+        subject: 'Inventario UHF — ${_fmtDate(DateTime.now())}',
+        text:
+            '${_unique.length} tags únicos, ${_allTags.length} lecturas totales',
       );
     } catch (e) {
-      _snack('Error: $e', err: true);
+      _snack('Error al exportar: $e', err: true);
     } finally {
       if (mounted) setState(() => _exporting = false);
     }
   }
 
-  String _fmtD(DateTime d) =>
+  // ═════════════════════════════════════════════════════════════════════════
+  // HELPERS
+  // ═════════════════════════════════════════════════════════════════════════
+
+  String _fmtDate(DateTime d) =>
       '${d.day.toString().padLeft(2, '0')}/${d.month.toString().padLeft(2, '0')}/${d.year}';
-  String _fmtT(DateTime d) =>
+  String _fmtTime(DateTime d) =>
       '${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}:${d.second.toString().padLeft(2, '0')}';
-  void _snack(String m, {bool err = false}) {
+
+  void _snack(String msg, {bool err = false}) {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(
         SnackBar(
-          content: Text(m),
-          backgroundColor: err ? _C.error : _C.success,
+          content: Text(msg),
+          backgroundColor: err ? _K.error : _K.success,
           behavior: SnackBarBehavior.floating,
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(10),
@@ -586,11 +802,14 @@ class _UhfRfidReaderPageState extends State<UhfRfidReaderPage> {
       );
   }
 
-  String get _devName => widget.device.platformName.isNotEmpty
+  String get _deviceName => widget.device.platformName.isNotEmpty
       ? widget.device.platformName
       : widget.device.remoteId.str;
 
-  // ─── BUILD ─────────────────────────────────────────────────────────────
+  // ═════════════════════════════════════════════════════════════════════════
+  // BUILD
+  // ═════════════════════════════════════════════════════════════════════════
+
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
@@ -598,210 +817,226 @@ class _UhfRfidReaderPageState extends State<UhfRfidReaderPage> {
         if (_fabOpen) setState(() => _fabOpen = false);
       },
       child: Scaffold(
-        backgroundColor: _C.bg,
-        appBar: _appBar(),
+        backgroundColor: _K.bg,
+        appBar: _buildAppBar(),
         body: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            _header(),
-            _stats(),
-            const _Div(),
-            Expanded(child: _list()),
+            _buildDeviceCard(),
+            _buildStats(),
+            _buildDivider(),
+            Expanded(child: _buildTagList()),
           ],
         ),
-        floatingActionButton: _fab(),
+        floatingActionButton: _buildFAB(),
       ),
     );
   }
 
-  PreferredSizeWidget _appBar() => AppBar(
-    backgroundColor: _C.bgAppBar,
-    elevation: 0,
-    leading: IconButton(
-      icon: Icon(
-        Icons.arrow_back_ios_new,
-        color: _C.textSecondaryAppBar,
-        size: 18,
-      ),
-      onPressed: () => Navigator.pop(context),
-    ),
-    title: Text(
-      'Lector UHF RFID',
-      style: TextStyle(
-        color: _C.textPrimaryAppBar,
-        fontSize: 17,
-        fontWeight: FontWeight.w700,
-      ),
-    ),
-    actions: [
-      if (_tags.isNotEmpty)
-        IconButton(
-          icon: Icon(Icons.delete_sweep_outlined, color: _C.textSecondary),
-          onPressed: _clearTags,
+  // ── AppBar ─────────────────────────────────────────────────────────────
+  PreferredSizeWidget _buildAppBar() {
+    return AppBar(
+      backgroundColor: _K.primary,
+      elevation: 0,
+      leading: IconButton(
+        icon: const Icon(
+          Icons.arrow_back_ios_new,
+          color: Colors.white70,
+          size: 18,
         ),
-      Padding(
-        padding: const EdgeInsets.only(right: 8),
-        child: TextButton.icon(
-          onPressed: _connected ? (_listening ? _stopScan : _startScan) : null,
-          icon: Icon(
-            _listening ? Icons.pause_circle_outline : Icons.play_circle_outline,
-            size: 18,
-            color: _listening ? _C.warning : _C.success,
-          ),
-          style: TextButton.styleFrom(
-            backgroundColor: Colors.grey[100],
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(20),
-            ),
-            side: BorderSide(color: _listening ? _C.warning : _C.success),
-          ),
-          label: Text(
-            _listening ? 'Pausar' : 'Escanear',
-            style: TextStyle(
-              color: _listening ? _C.warning : _C.success,
-              fontSize: 13,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
+        onPressed: () => Navigator.pop(context),
+      ),
+      title: const Text(
+        'Inventario UHF RFID',
+        style: TextStyle(
+          color: Colors.white,
+          fontSize: 17,
+          fontWeight: FontWeight.w700,
         ),
       ),
-    ],
-  );
+      actions: [
+        if (_allTags.isNotEmpty)
+          IconButton(
+            icon: Icon(
+              Icons.delete_sweep_outlined,
+              color: Colors.white.withOpacity(0.7),
+            ),
+            tooltip: 'Limpiar',
+            onPressed: _clearAll,
+          ),
+      ],
+    );
+  }
 
-  Widget _header() => Container(
-    margin: const EdgeInsets.fromLTRB(16, 14, 16, 0),
-    padding: const EdgeInsets.all(16),
-    decoration: BoxDecoration(
-      gradient: LinearGradient(
-        colors: [_C.accent.withOpacity(0.18), _C.accent.withOpacity(0.06)],
-      ),
-      borderRadius: BorderRadius.circular(16),
-      border: Border.all(
-        color: (_connected ? _C.accent : _C.error).withOpacity(0.35),
-      ),
-    ),
-    child: Row(
-      children: [
-        Container(
-          width: 48,
-          height: 48,
-          decoration: BoxDecoration(
-            color: (_connected ? _C.accent : _C.error).withOpacity(0.15),
-            shape: BoxShape.circle,
-          ),
-          child: Icon(
-            _connected ? Icons.bluetooth_connected : Icons.bluetooth_disabled,
-            color: _connected ? _C.accent : _C.error,
-            size: 24,
-          ),
+  // ── Tarjeta dispositivo + botones inventario ───────────────────────────
+  Widget _buildDeviceCard() {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 14, 16, 0),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors: [_K.primary.withOpacity(0.15), _K.primary.withOpacity(0.04)],
         ),
-        const SizedBox(width: 14),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: (_connected ? _K.primary : _K.error).withOpacity(0.35),
+        ),
+      ),
+      child: Column(
+        children: [
+          // Info del dispositivo
+          Row(
             children: [
-              Row(
-                children: [
-                  Container(
-                    width: 7,
-                    height: 7,
-                    decoration: BoxDecoration(
-                      color: _connected ? _C.success : _C.error,
-                      shape: BoxShape.circle,
-                    ),
-                  ),
-                  const SizedBox(width: 6),
-                  Text(
-                    _connected ? 'Conectado' : 'Desconectado',
-                    style: TextStyle(
-                      color: _connected ? _C.success : _C.error,
-                      fontSize: 11,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 3),
-              Text(
-                _devName,
-                style: TextStyle(
-                  color: _C.textPrimary,
-                  fontSize: 15,
-                  fontWeight: FontWeight.w700,
+              Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  color: (_connected ? _K.primary : _K.error).withOpacity(0.12),
+                  shape: BoxShape.circle,
                 ),
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
+                child: Icon(
+                  _connected
+                      ? Icons.bluetooth_connected
+                      : Icons.bluetooth_disabled,
+                  color: _connected ? _K.primary : _K.error,
+                  size: 22,
+                ),
               ),
-              Text(
-                widget.device.remoteId.str,
-                style: TextStyle(
-                  color: _C.textSecondary,
-                  fontSize: 11,
-                  fontFamily: 'monospace',
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Container(
+                          width: 7,
+                          height: 7,
+                          decoration: BoxDecoration(
+                            color: _connected ? _K.success : _K.error,
+                            shape: BoxShape.circle,
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          _connected ? 'Conectado' : 'Desconectado',
+                          style: TextStyle(
+                            color: _connected ? _K.success : _K.error,
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      _deviceName,
+                      style: TextStyle(
+                        color: _K.textPrimary,
+                        fontSize: 15,
+                        fontWeight: FontWeight.w700,
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    Text(
+                      widget.device.remoteId.str,
+                      style: TextStyle(
+                        color: _K.textSec,
+                        fontSize: 11,
+                        fontFamily: 'monospace',
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              if (_scanning) _PulsingDot(color: _K.success),
+            ],
+          ),
+          const SizedBox(height: 14),
+
+          // ── Botones INICIAR / DETENER ──────────────────────────────────
+          Row(
+            children: [
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: (!_connected || _scanning)
+                      ? null
+                      : _startInventory,
+                  icon: const Icon(Icons.play_arrow_rounded, size: 20),
+                  label: const Text('Iniciar Inventario'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: _K.success,
+                    foregroundColor: Colors.white,
+                    disabledBackgroundColor: _K.success.withOpacity(0.3),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: (!_connected || !_scanning)
+                      ? null
+                      : _stopInventory,
+                  icon: const Icon(Icons.stop_rounded, size: 20),
+                  label: const Text('Detener'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: _K.error,
+                    foregroundColor: Colors.white,
+                    disabledBackgroundColor: _K.error.withOpacity(0.3),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                  ),
                 ),
               ),
             ],
           ),
-        ),
-        Column(
-          crossAxisAlignment: CrossAxisAlignment.end,
-          children: [
-            _listening
-                ? _PulsingDot(color: _C.success)
-                : Container(
-                    width: 10,
-                    height: 10,
-                    decoration: BoxDecoration(
-                      color: _C.border,
-                      shape: BoxShape.circle,
-                    ),
-                  ),
-            const SizedBox(height: 4),
-            Text(
-              _listening ? 'ACTIVO' : 'PAUSADO',
-              style: TextStyle(
-                color: _listening ? _C.success : _C.textSecondary,
-                fontSize: 10,
-                fontWeight: FontWeight.w700,
-                letterSpacing: 1,
-              ),
-            ),
-          ],
-        ),
-      ],
-    ),
+        ],
+      ),
+    );
+  }
+
+  // ── Stats ──────────────────────────────────────────────────────────────
+  Widget _buildStats() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+      child: Row(
+        children: [
+          _StatChip(Icons.tag, 'Lecturas', '${_allTags.length}', _K.primary),
+          const SizedBox(width: 10),
+          _StatChip(
+            Icons.fingerprint,
+            'Únicos',
+            '${_unique.length}',
+            _K.success,
+          ),
+          const SizedBox(width: 10),
+          _StatChip(
+            Icons.schedule,
+            'Última',
+            _allTags.isEmpty ? '—' : _fmtTime(_allTags.first.timestamp),
+            _K.warning,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDivider() => Container(
+    margin: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+    height: 1,
+    color: _K.border,
   );
 
-  Widget _stats() => Padding(
-    padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-    child: Row(
-      children: [
-        _Stat(
-          icon: Icons.tag,
-          label: 'Total',
-          value: '${_tags.length}',
-          color: _C.accent,
-        ),
-        const SizedBox(width: 10),
-        _Stat(
-          icon: Icons.fingerprint,
-          label: 'Únicos',
-          value: '${_unique.length}',
-          color: _C.success,
-        ),
-        const SizedBox(width: 10),
-        _Stat(
-          icon: Icons.schedule,
-          label: 'Última',
-          value: _tags.isEmpty ? '—' : _fmtT(_tags.first.timestamp),
-          color: _C.warning,
-        ),
-      ],
-    ),
-  );
-
-  Widget _list() {
-    if (_tags.isEmpty)
+  // ── Tag List ───────────────────────────────────────────────────────────
+  Widget _buildTagList() {
+    if (_unique.isEmpty) {
       return Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -809,99 +1044,103 @@ class _UhfRfidReaderPageState extends State<UhfRfidReaderPage> {
             Container(
               padding: const EdgeInsets.all(24),
               decoration: BoxDecoration(
-                color: _C.accent.withOpacity(0.07),
+                color: _K.primary.withOpacity(0.07),
                 shape: BoxShape.circle,
               ),
               child: Icon(
                 Icons.nfc,
                 size: 48,
-                color: _C.accent.withOpacity(0.45),
+                color: _K.primary.withOpacity(0.4),
               ),
             ),
             const SizedBox(height: 18),
             Text(
-              'Sin lecturas UHF',
+              'Sin etiquetas UHF',
               style: TextStyle(
-                color: _C.textPrimary,
+                color: _K.textPrimary,
                 fontSize: 17,
                 fontWeight: FontWeight.w700,
               ),
             ),
             const SizedBox(height: 8),
             Text(
-              _listening
-                  ? 'Acerca etiquetas UHF al VH-C77P'
-                  : 'Presiona "Escanear" para iniciar',
+              _scanning
+                  ? 'Acerca etiquetas UHF al lector VH-C77P…'
+                  : 'Presiona "Iniciar Inventario" para comenzar',
               textAlign: TextAlign.center,
-              style: TextStyle(color: _C.textSecondary, fontSize: 13),
+              style: TextStyle(color: _K.textSec, fontSize: 13, height: 1.5),
             ),
           ],
         ),
       );
+    }
+
+    final tags = _unique.values.toList()
+      ..sort((a, b) => b.timestamp.compareTo(a.timestamp));
+
     return ListView.builder(
       controller: _scroll,
-      padding: const EdgeInsets.fromLTRB(16, 10, 16, 110),
-      itemCount: _tags.length,
-      itemBuilder: (_, i) => _tile(_tags[i], i),
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 100),
+      itemCount: tags.length,
+      itemBuilder: (_, i) => _buildTagTile(tags[i], i),
     );
   }
 
-  Widget _tile(UhfTag tag, int i) {
-    final isNew = i == 0;
-    return AnimatedContainer(
-      duration: const Duration(milliseconds: 400),
+  Widget _buildTagTile(UhfTag tag, int index) {
+    final isFirst = index == 0 && _scanning;
+    return Container(
       margin: const EdgeInsets.only(bottom: 8),
       decoration: BoxDecoration(
-        color: isNew ? _C.accent.withOpacity(0.06) : _C.surface,
+        color: isFirst ? _K.primary.withOpacity(0.06) : _K.surface,
         borderRadius: BorderRadius.circular(14),
         border: Border.all(
-          color: isNew ? _C.accent.withOpacity(0.3) : _C.border,
-          width: isNew ? 1.5 : 1,
+          color: isFirst ? _K.primary.withOpacity(0.3) : _K.border,
+          width: isFirst ? 1.5 : 1,
         ),
       ),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
         child: Row(
           children: [
+            // Número / count
             Container(
-              width: 34,
-              height: 34,
+              width: 36,
+              height: 36,
               decoration: BoxDecoration(
-                color: _C.accent.withOpacity(0.12),
+                color: _K.primary.withOpacity(0.1),
                 borderRadius: BorderRadius.circular(8),
               ),
               child: Center(
                 child: Text(
-                  '${_tags.length - i}',
+                  '${tag.readCount}',
                   style: TextStyle(
-                    color: _C.accent,
-                    fontSize: 12,
-                    fontWeight: FontWeight.w700,
+                    color: _K.primary,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w800,
                   ),
                 ),
               ),
             ),
             const SizedBox(width: 12),
+            // Info
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  // EPC
                   Row(
                     children: [
-                      Icon(Icons.nfc, size: 13, color: _C.accent),
+                      Icon(Icons.nfc, size: 13, color: _K.primary),
                       const SizedBox(width: 5),
-                      Text(
-                        'EPC: ',
-                        style: TextStyle(color: _C.textSecondary, fontSize: 10),
-                      ),
                       Expanded(
                         child: Text(
                           tag.epc,
                           style: TextStyle(
-                            color: _C.textPrimary,
+                            color: _K.textPrimary,
                             fontSize: 13,
                             fontWeight: FontWeight.w700,
                             fontFamily: 'monospace',
+                            letterSpacing: 0.3,
                           ),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
@@ -909,100 +1148,53 @@ class _UhfRfidReaderPageState extends State<UhfRfidReaderPage> {
                       ),
                     ],
                   ),
-                  if (tag.tid.isNotEmpty)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 2),
-                      child: Row(
-                        children: [
-                          Text(
-                            'TID: ',
-                            style: TextStyle(
-                              color: _C.textSecondary,
-                              fontSize: 10,
-                            ),
-                          ),
-                          Expanded(
-                            child: Text(
-                              tag.tid,
-                              style: TextStyle(
-                                color: _C.success,
-                                fontSize: 10,
-                                fontFamily: 'monospace',
-                              ),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  if (tag.userData.isNotEmpty)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 2),
-                      child: Row(
-                        children: [
-                          Text(
-                            'USR: ',
-                            style: TextStyle(
-                              color: _C.textSecondary,
-                              fontSize: 10,
-                            ),
-                          ),
-                          Expanded(
-                            child: Text(
-                              tag.userData,
-                              style: TextStyle(
-                                color: _C.warning,
-                                fontSize: 10,
-                                fontFamily: 'monospace',
-                              ),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  const SizedBox(height: 3),
+                  const SizedBox(height: 4),
+                  // RSSI + time
                   Row(
                     children: [
                       Icon(
                         Icons.signal_cellular_alt,
                         size: 11,
-                        color: _C.textSecondary,
+                        color: _K.textSec,
                       ),
                       const SizedBox(width: 3),
                       Text(
-                        '${tag.rssi}dBm',
-                        style: TextStyle(color: _C.textSecondary, fontSize: 10),
+                        '${tag.rssi} dBm',
+                        style: TextStyle(color: _K.textSec, fontSize: 10),
                       ),
-                      const SizedBox(width: 10),
-                      Icon(
-                        Icons.access_time,
-                        size: 11,
-                        color: _C.textSecondary,
-                      ),
+                      const SizedBox(width: 12),
+                      Icon(Icons.access_time, size: 11, color: _K.textSec),
                       const SizedBox(width: 3),
                       Text(
-                        _fmtT(tag.timestamp),
-                        style: TextStyle(color: _C.textSecondary, fontSize: 10),
+                        _fmtTime(tag.timestamp),
+                        style: TextStyle(color: _K.textSec, fontSize: 10),
+                      ),
+                      const SizedBox(width: 12),
+                      Text(
+                        'PC: ${tag.pc}',
+                        style: TextStyle(
+                          color: _K.textSec,
+                          fontSize: 10,
+                          fontFamily: 'monospace',
+                        ),
                       ),
                     ],
                   ),
                 ],
               ),
             ),
-            if (isNew)
+            // Badge
+            if (isFirst)
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
                 decoration: BoxDecoration(
-                  color: _C.success.withOpacity(0.15),
+                  color: _K.success.withOpacity(0.15),
                   borderRadius: BorderRadius.circular(6),
                 ),
                 child: Text(
-                  'NUEVO',
+                  'NEW',
                   style: TextStyle(
-                    color: _C.success,
+                    color: _K.success,
                     fontSize: 9,
                     fontWeight: FontWeight.w800,
                     letterSpacing: 0.8,
@@ -1015,199 +1207,185 @@ class _UhfRfidReaderPageState extends State<UhfRfidReaderPage> {
     );
   }
 
-  Widget _fab() => Column(
-    mainAxisSize: MainAxisSize.min,
-    crossAxisAlignment: CrossAxisAlignment.end,
-    children: [
-      AnimatedSwitcher(
-        duration: const Duration(milliseconds: 250),
-        transitionBuilder: (c, a) => FadeTransition(
-          opacity: a,
-          child: SlideTransition(
-            position: Tween<Offset>(
-              begin: const Offset(0, 0.3),
-              end: Offset.zero,
-            ).animate(a),
-            child: c,
+  // ── FAB expandible ─────────────────────────────────────────────────────
+  Widget _buildFAB() {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.end,
+      children: [
+        AnimatedSwitcher(
+          duration: const Duration(milliseconds: 250),
+          transitionBuilder: (child, anim) => FadeTransition(
+            opacity: anim,
+            child: SlideTransition(
+              position: Tween<Offset>(
+                begin: const Offset(0, 0.3),
+                end: Offset.zero,
+              ).animate(anim),
+              child: child,
+            ),
+          ),
+          child: _fabOpen
+              ? Column(
+                  key: const ValueKey('open'),
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    _FabOption(
+                      icon: Icons.terminal,
+                      label: 'Ver Logs (${_logs.length})',
+                      color: _K.primary,
+                      onTap: _showLogs,
+                    ),
+                    const SizedBox(height: 10),
+                    _FabOption(
+                      icon: Icons.file_download_outlined,
+                      label: _unique.isEmpty
+                          ? 'Sin datos'
+                          : 'Exportar Excel (${_unique.length})',
+                      color: _unique.isEmpty ? _K.border : _K.success,
+                      onTap: _unique.isEmpty || _exporting
+                          ? null
+                          : _exportExcel,
+                      isLoading: _exporting,
+                    ),
+                    const SizedBox(height: 12),
+                  ],
+                )
+              : const SizedBox.shrink(key: ValueKey('closed')),
+        ),
+        FloatingActionButton(
+          onPressed: () => setState(() => _fabOpen = !_fabOpen),
+          backgroundColor: _K.primary,
+          elevation: 4,
+          child: AnimatedRotation(
+            turns: _fabOpen ? 0.125 : 0,
+            duration: const Duration(milliseconds: 250),
+            child: const Icon(Icons.add, color: Colors.white, size: 28),
           ),
         ),
-        child: _fabOpen
-            ? Column(
-                key: const ValueKey('o'),
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: [
-                  _Fb(
-                    icon: Icons.memory,
-                    label: _readingExtra
-                        ? 'Leyendo...'
-                        : 'Leer TID+User (${_unique.length})',
-                    color: _readingExtra || _unique.isEmpty
-                        ? _C.border
-                        : _C.warning,
-                    onTap: _readingExtra || _unique.isEmpty
-                        ? null
-                        : () {
-                            setState(() => _fabOpen = false);
-                            _readAllExtra();
-                          },
-                    isLoading: _readingExtra,
-                  ),
-                  const SizedBox(height: 10),
-                  _Fb(
-                    icon: Icons.terminal,
-                    label: 'Ver Logs (${_logs.length})',
-                    color: _C.accent,
-                    onTap: _showLogs,
-                  ),
-                  const SizedBox(height: 10),
-                  _Fb(
-                    icon: Icons.file_download_outlined,
-                    label: _tags.isEmpty
-                        ? 'Sin datos'
-                        : 'Exportar (${_tags.length})',
-                    color: _tags.isEmpty ? _C.border : _C.export,
-                    onTap: _tags.isEmpty || _exporting ? null : _export,
-                    isLoading: _exporting,
-                  ),
-                  const SizedBox(height: 12),
-                ],
-              )
-            : const SizedBox.shrink(key: ValueKey('c')),
-      ),
-      FloatingActionButton(
-        onPressed: () => setState(() => _fabOpen = !_fabOpen),
-        backgroundColor: _C.accent,
-        elevation: 4,
-        child: AnimatedRotation(
-          turns: _fabOpen ? 0.125 : 0,
-          duration: const Duration(milliseconds: 250),
-          child: const Icon(Icons.add, color: Colors.white, size: 28),
-        ),
-      ),
-    ],
-  );
+      ],
+    );
+  }
 }
 
-// ─── Widgets auxiliares ────────────────────────────────────────────────────
-class _Fb extends StatelessWidget {
+// ═══════════════════════════════════════════════════════════════════════════════
+// WIDGETS AUXILIARES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+class _FabOption extends StatelessWidget {
   final IconData icon;
   final String label;
   final Color color;
   final VoidCallback? onTap;
   final bool isLoading;
-  const _Fb({
+
+  const _FabOption({
     required this.icon,
     required this.label,
     required this.color,
     this.onTap,
     this.isLoading = false,
   });
+
   @override
-  Widget build(BuildContext c) => Material(
-    color: Colors.transparent,
-    child: InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(28),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-        decoration: BoxDecoration(
-          color: _C.surface,
-          borderRadius: BorderRadius.circular(28),
-          border: Border.all(color: color.withOpacity(0.3)),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withOpacity(0.25),
-              blurRadius: 8,
-              offset: const Offset(0, 3),
-            ),
-          ],
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (isLoading)
-              SizedBox(
-                width: 16,
-                height: 16,
-                child: CircularProgressIndicator(strokeWidth: 2, color: color),
-              )
-            else
-              Icon(icon, size: 16, color: color),
-            const SizedBox(width: 8),
-            Text(
-              label,
-              style: TextStyle(
-                color: onTap == null ? _C.textSecondary : _C.textPrimary,
-                fontSize: 13,
-                fontWeight: FontWeight.w600,
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(28),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          decoration: BoxDecoration(
+            color: _K.surface,
+            borderRadius: BorderRadius.circular(28),
+            border: Border.all(color: color.withOpacity(0.3)),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.2),
+                blurRadius: 8,
+                offset: const Offset(0, 3),
               ),
-            ),
-          ],
-        ),
-      ),
-    ),
-  );
-}
-
-class _Div extends StatelessWidget {
-  const _Div();
-  @override
-  Widget build(BuildContext c) => Container(
-    margin: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-    height: 1,
-    color: _C.border,
-  );
-}
-
-class _Stat extends StatelessWidget {
-  final IconData icon;
-  final String label, value;
-  final Color color;
-  const _Stat({
-    required this.icon,
-    required this.label,
-    required this.value,
-    required this.color,
-  });
-  @override
-  Widget build(BuildContext c) => Expanded(
-    child: Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      decoration: BoxDecoration(
-        color: color.withOpacity(0.08),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: color.withOpacity(0.2)),
-      ),
-      child: Row(
-        children: [
-          Icon(icon, size: 16, color: color),
-          const SizedBox(width: 8),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+            ],
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
             children: [
+              if (isLoading)
+                SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: color,
+                  ),
+                )
+              else
+                Icon(icon, size: 16, color: color),
+              const SizedBox(width: 8),
               Text(
                 label,
                 style: TextStyle(
-                  color: _C.textSecondary,
-                  fontSize: 10,
-                  fontWeight: FontWeight.w500,
-                ),
-              ),
-              Text(
-                value,
-                style: TextStyle(
-                  color: _C.textPrimary,
-                  fontSize: 15,
-                  fontWeight: FontWeight.w700,
+                  color: onTap == null ? _K.textSec : _K.textPrimary,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
                 ),
               ),
             ],
           ),
-        ],
+        ),
       ),
-    ),
-  );
+    );
+  }
+}
+
+class _StatChip extends StatelessWidget {
+  final IconData icon;
+  final String label, value;
+  final Color color;
+  const _StatChip(this.icon, this.label, this.value, this.color);
+
+  @override
+  Widget build(BuildContext context) {
+    return Expanded(
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: BoxDecoration(
+          color: color.withOpacity(0.08),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: color.withOpacity(0.2)),
+        ),
+        child: Row(
+          children: [
+            Icon(icon, size: 16, color: color),
+            const SizedBox(width: 8),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: TextStyle(
+                    color: _K.textSec,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+                Text(
+                  value,
+                  style: TextStyle(
+                    color: _K.textPrimary,
+                    fontSize: 15,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 class _PulsingDot extends StatefulWidget {
@@ -1221,6 +1399,7 @@ class _PulsingDotState extends State<_PulsingDot>
     with SingleTickerProviderStateMixin {
   late AnimationController _c;
   late Animation<double> _a;
+
   @override
   void initState() {
     super.initState();
@@ -1229,7 +1408,7 @@ class _PulsingDotState extends State<_PulsingDot>
       duration: const Duration(milliseconds: 800),
     )..repeat(reverse: true);
     _a = Tween(
-      begin: 0.4,
+      begin: 0.3,
       end: 1.0,
     ).animate(CurvedAnimation(parent: _c, curve: Curves.easeInOut));
   }
@@ -1241,178 +1420,146 @@ class _PulsingDotState extends State<_PulsingDot>
   }
 
   @override
-  Widget build(BuildContext c) => FadeTransition(
+  Widget build(BuildContext context) => FadeTransition(
     opacity: _a,
     child: Container(
-      width: 10,
-      height: 10,
+      width: 12,
+      height: 12,
       decoration: BoxDecoration(color: widget.color, shape: BoxShape.circle),
     ),
   );
 }
 
-// ─── Logs Sheet ────────────────────────────────────────────────────────────
-class _BleLogsSheet extends StatefulWidget {
-  final List<BleLogEntry> logs;
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOGS BOTTOM SHEET
+// ═══════════════════════════════════════════════════════════════════════════════
+
+class _LogsSheet extends StatefulWidget {
+  final List<_LogEntry> logs;
   final VoidCallback onClear;
-  final String Function(DateTime) formatTime, formatDate;
-  const _BleLogsSheet({
-    required this.logs,
-    required this.onClear,
-    required this.formatTime,
-    required this.formatDate,
-  });
+  const _LogsSheet({required this.logs, required this.onClear});
+
   @override
-  State<_BleLogsSheet> createState() => _BleLogsSheetState();
+  State<_LogsSheet> createState() => _LogsSheetState();
 }
 
-class _BleLogsSheetState extends State<_BleLogsSheet> {
-  String _f = 'ALL';
-  final ScrollController _sc = ScrollController();
-  @override
-  void dispose() {
-    _sc.dispose();
-    super.dispose();
-  }
+class _LogsSheetState extends State<_LogsSheet> {
+  String _filter = 'ALL';
 
-  List<BleLogEntry> get _fl => _f == 'ALL'
+  List<_LogEntry> get _filtered => _filter == 'ALL'
       ? widget.logs
-      : widget.logs.where((l) => l.direction == _f).toList();
-  Color _dc(String d) {
+      : widget.logs.where((l) => l.dir == _filter).toList();
+
+  Color _dirColor(String d) {
     switch (d) {
       case 'RX':
-        return _C.success;
+        return _K.success;
       case 'TX':
-        return _C.accent;
+        return _K.primary;
       case 'SYS':
-        return _C.warning;
+        return _K.warning;
       default:
-        return _C.textSecondary;
+        return _K.textSec;
     }
   }
 
-  IconData _di(String d) {
-    switch (d) {
-      case 'RX':
-        return Icons.arrow_downward;
-      case 'TX':
-        return Icons.arrow_upward;
-      case 'SYS':
-        return Icons.info_outline;
-      default:
-        return Icons.circle;
-    }
-  }
+  String _fmtTime(DateTime d) =>
+      '${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}:${d.second.toString().padLeft(2, '0')}';
 
   @override
-  Widget build(BuildContext c) {
-    final fl = _fl;
+  Widget build(BuildContext context) {
+    final items = _filtered;
     return Container(
-      height: MediaQuery.of(c).size.height * 0.85,
+      height: MediaQuery.of(context).size.height * 0.85,
       decoration: BoxDecoration(
-        color: _C.bg,
+        color: _K.bg,
         borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
       ),
       child: Column(
         children: [
+          // Handle
           Center(
             child: Container(
               margin: const EdgeInsets.only(top: 10, bottom: 6),
               width: 36,
               height: 4,
               decoration: BoxDecoration(
-                color: _C.border,
+                color: _K.border,
                 borderRadius: BorderRadius.circular(2),
               ),
             ),
           ),
+          // Header
           Padding(
             padding: const EdgeInsets.fromLTRB(18, 6, 12, 6),
             child: Row(
               children: [
-                Icon(Icons.terminal, color: _C.accent, size: 20),
+                Icon(Icons.terminal, color: _K.primary, size: 20),
                 const SizedBox(width: 10),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'Logs BLE (UHF)',
+                        'Logs BLE / UHF',
                         style: TextStyle(
-                          color: _C.textPrimary,
+                          color: _K.textPrimary,
                           fontSize: 16,
                           fontWeight: FontWeight.w700,
                         ),
                       ),
                       Text(
-                        '${widget.logs.length} entradas • ${fl.length} visibles',
-                        style: TextStyle(color: _C.textSecondary, fontSize: 11),
+                        '${widget.logs.length} entradas • ${items.length} visibles',
+                        style: TextStyle(color: _K.textSec, fontSize: 11),
                       ),
                     ],
                   ),
                 ),
                 IconButton(
-                  icon: Icon(Icons.delete_outline, color: _C.error, size: 20),
+                  icon: Icon(Icons.delete_outline, color: _K.error, size: 20),
                   onPressed: widget.onClear,
                 ),
                 IconButton(
-                  icon: Icon(Icons.close, color: _C.textSecondary, size: 20),
-                  onPressed: () => Navigator.pop(c),
+                  icon: Icon(Icons.close, color: _K.textSec, size: 20),
+                  onPressed: () => Navigator.pop(context),
                 ),
               ],
             ),
           ),
+          // Filtros
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
             child: Row(
               children: [
-                _LF(
-                  label: 'Todo',
-                  act: _f == 'ALL',
-                  color: _C.textPrimary,
-                  onTap: () => setState(() => _f = 'ALL'),
-                ),
-                const SizedBox(width: 6),
-                _LF(
-                  label: 'RX',
-                  act: _f == 'RX',
-                  color: _C.success,
-                  onTap: () => setState(() => _f = 'RX'),
-                ),
-                const SizedBox(width: 6),
-                _LF(
-                  label: 'TX',
-                  act: _f == 'TX',
-                  color: _C.accent,
-                  onTap: () => setState(() => _f = 'TX'),
-                ),
-                const SizedBox(width: 6),
-                _LF(
-                  label: 'SYS',
-                  act: _f == 'SYS',
-                  color: _C.warning,
-                  onTap: () => setState(() => _f = 'SYS'),
-                ),
+                for (final f in ['ALL', 'TX', 'RX', 'SYS']) ...[
+                  if (f != 'ALL') const SizedBox(width: 6),
+                  _FilterChip(
+                    label: f == 'ALL' ? 'Todo' : f,
+                    active: _filter == f,
+                    color: f == 'ALL' ? _K.textPrimary : _dirColor(f),
+                    onTap: () => setState(() => _filter = f),
+                  ),
+                ],
               ],
             ),
           ),
           const SizedBox(height: 8),
-          Container(height: 1, color: _C.border),
+          Container(height: 1, color: _K.border),
+          // Lista
           Expanded(
-            child: fl.isEmpty
+            child: items.isEmpty
                 ? Center(
                     child: Text(
                       'Sin logs',
-                      style: TextStyle(color: _C.textSecondary),
+                      style: TextStyle(color: _K.textSec),
                     ),
                   )
                 : ListView.builder(
-                    controller: _sc,
                     padding: const EdgeInsets.fromLTRB(12, 8, 12, 24),
-                    itemCount: fl.length,
+                    itemCount: items.length,
                     itemBuilder: (_, i) {
-                      final e = fl[i];
-                      final dc = _dc(e.direction);
+                      final e = items[i];
+                      final dc = _dirColor(e.dir);
                       return Padding(
                         padding: const EdgeInsets.only(bottom: 4),
                         child: Container(
@@ -1421,10 +1568,10 @@ class _BleLogsSheetState extends State<_BleLogsSheet> {
                             vertical: 7,
                           ),
                           decoration: BoxDecoration(
-                            color: _C.surface,
+                            color: _K.surface,
                             borderRadius: BorderRadius.circular(8),
                             border: Border.all(
-                              color: _C.border.withOpacity(0.5),
+                              color: _K.border.withOpacity(0.5),
                             ),
                           ),
                           child: Column(
@@ -1441,44 +1588,31 @@ class _BleLogsSheetState extends State<_BleLogsSheet> {
                                       color: dc.withOpacity(0.15),
                                       borderRadius: BorderRadius.circular(4),
                                     ),
-                                    child: Row(
-                                      mainAxisSize: MainAxisSize.min,
-                                      children: [
-                                        Icon(
-                                          _di(e.direction),
-                                          size: 10,
-                                          color: dc,
-                                        ),
-                                        const SizedBox(width: 3),
-                                        Text(
-                                          e.direction,
-                                          style: TextStyle(
-                                            color: dc,
-                                            fontSize: 9,
-                                            fontWeight: FontWeight.w800,
-                                            fontFamily: 'monospace',
-                                          ),
-                                        ),
-                                      ],
+                                    child: Text(
+                                      e.dir,
+                                      style: TextStyle(
+                                        color: dc,
+                                        fontSize: 9,
+                                        fontWeight: FontWeight.w800,
+                                        fontFamily: 'monospace',
+                                      ),
                                     ),
                                   ),
                                   const SizedBox(width: 8),
                                   Text(
-                                    widget.formatTime(e.timestamp),
+                                    _fmtTime(e.ts),
                                     style: TextStyle(
-                                      color: _C.textSecondary,
+                                      color: _K.textSec,
                                       fontSize: 10,
                                       fontFamily: 'monospace',
                                     ),
                                   ),
-                                  if (e.byteCount > 0) ...[
+                                  if (e.bytes > 0) ...[
                                     const SizedBox(width: 8),
                                     Text(
-                                      '${e.byteCount}B',
+                                      '${e.bytes}B',
                                       style: TextStyle(
-                                        color: _C.textSecondary.withOpacity(
-                                          0.6,
-                                        ),
+                                        color: _K.textSec.withOpacity(0.6),
                                         fontSize: 9,
                                         fontFamily: 'monospace',
                                       ),
@@ -1488,27 +1622,27 @@ class _BleLogsSheetState extends State<_BleLogsSheet> {
                               ),
                               const SizedBox(height: 4),
                               Text(
-                                e.description,
+                                e.desc,
                                 style: TextStyle(
-                                  color: _C.textPrimary,
+                                  color: _K.textPrimary,
                                   fontSize: 12,
                                   fontFamily: 'monospace',
                                   height: 1.4,
                                 ),
                               ),
-                              if (e.rawHex.isNotEmpty) ...[
+                              if (e.hex.isNotEmpty) ...[
                                 const SizedBox(height: 3),
                                 Container(
                                   width: double.infinity,
                                   padding: const EdgeInsets.all(6),
                                   decoration: BoxDecoration(
-                                    color: _C.bg,
+                                    color: _K.bg,
                                     borderRadius: BorderRadius.circular(4),
                                   ),
                                   child: Text(
-                                    e.rawHex,
+                                    e.hex,
                                     style: TextStyle(
-                                      color: _C.accent.withOpacity(0.8),
+                                      color: _K.primary.withOpacity(0.8),
                                       fontSize: 10,
                                       fontFamily: 'monospace',
                                       letterSpacing: 0.5,
@@ -1529,41 +1663,50 @@ class _BleLogsSheetState extends State<_BleLogsSheet> {
   }
 }
 
-class _LF extends StatelessWidget {
+class _FilterChip extends StatelessWidget {
   final String label;
-  final bool act;
+  final bool active;
   final Color color;
   final VoidCallback onTap;
-  const _LF({
+  const _FilterChip({
     required this.label,
-    required this.act,
+    required this.active,
     required this.color,
     required this.onTap,
   });
+
   @override
-  Widget build(BuildContext c) => GestureDetector(
-    onTap: onTap,
-    child: AnimatedContainer(
-      duration: const Duration(milliseconds: 200),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-      decoration: BoxDecoration(
-        color: act ? color.withOpacity(0.15) : _C.surface,
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: act ? color.withOpacity(0.4) : _C.border),
-      ),
-      child: Text(
-        label,
-        style: TextStyle(
-          color: act ? color : _C.textSecondary,
-          fontSize: 11,
-          fontWeight: act ? FontWeight.w700 : FontWeight.w500,
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        decoration: BoxDecoration(
+          color: active ? color.withOpacity(0.15) : _K.surface,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: active ? color.withOpacity(0.4) : _K.border,
+          ),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: active ? color : _K.textSec,
+            fontSize: 11,
+            fontWeight: active ? FontWeight.w700 : FontWeight.w500,
+          ),
         ),
       ),
-    ),
-  );
+    );
+  }
 }
 
-final _hdrStyle = xl.CellStyle(
+// ═══════════════════════════════════════════════════════════════════════════════
+// ESTILOS EXCEL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+final _xlHeader = xl.CellStyle(
   fontFamily: xl.getFontFamily(xl.FontFamily.Arial),
   bold: true,
   fontColorHex: xl.ExcelColor.white,
@@ -1571,18 +1714,28 @@ final _hdrStyle = xl.CellStyle(
   horizontalAlign: xl.HorizontalAlign.Center,
 );
 
-abstract class _C {
-  static const bgAppBar = Color(0xFF2563EB),
-      bg = Color(0xFFF5F7FA),
-      surface = Color(0xFFFFFFFF),
-      border = Color(0xFFE2E6ED);
-  static const accent = Color(0xFF2563EB),
-      success = Color(0xFF16A34A),
-      warning = Color(0xFFD97706),
-      error = Color(0xFFDC2626),
-      export = Color(0xFF16A34A);
-  static const textPrimary = Color(0xFF1A1D27),
-      textPrimaryAppBar = Color.fromRGBO(255, 255, 255, 1),
-      textSecondary = Color(0xFF6B7280),
-      textSecondaryAppBar = Color.fromRGBO(224, 224, 224, 1);
+final _xlEven = xl.CellStyle(
+  fontFamily: xl.getFontFamily(xl.FontFamily.Arial),
+  backgroundColorHex: xl.ExcelColor.fromHexString('#EEF3FB'),
+);
+
+final _xlOdd = xl.CellStyle(
+  fontFamily: xl.getFontFamily(xl.FontFamily.Arial),
+  backgroundColorHex: xl.ExcelColor.white,
+);
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PALETA DE COLORES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+abstract class _K {
+  static const primary = Color(0xFF2563EB);
+  static const bg = Color(0xFFF5F7FA);
+  static const surface = Color(0xFFFFFFFF);
+  static const border = Color(0xFFE2E6ED);
+  static const success = Color(0xFF16A34A);
+  static const warning = Color(0xFFD97706);
+  static const error = Color(0xFFDC2626);
+  static const textPrimary = Color(0xFF1A1D27);
+  static const textSec = Color(0xFF6B7280);
 }
