@@ -324,7 +324,7 @@ class _UhcRfidReaderScanPageState extends State<UhcRfidReaderScanPage> {
           if (c.properties.indicate) props.add('I');
           _addLog(
             'RX',
-            '${svc.uuid.toString().substring(4, 8).toUpperCase()}: ${c.uuid.toString().toUpperCase()} [${props.join(",")}]',
+            'Svc ${svc.uuid.toString().toUpperCase()} → ${c.uuid.toString().toUpperCase()} [${props.join(",")}]',
           );
         }
       }
@@ -480,11 +480,22 @@ class _UhcRfidReaderScanPageState extends State<UhcRfidReaderScanPage> {
       final raw = _rxBuf.sublist(0, frameLen);
       _rxBuf.removeRange(0, frameLen);
 
+      final rawHex = raw
+          .map((b) => b.toRadixString(16).padLeft(2, '0'))
+          .join(' ')
+          .toUpperCase();
+      _addLog(
+        'SYS',
+        '📋 Frame completo (${raw.length}B): type=0x${raw[1].toRadixString(16).padLeft(2, '0')} cmd=0x${raw[2].toRadixString(16).padLeft(2, '0')}',
+        hex: rawHex,
+        bc: raw.length,
+      );
+
       final frame = UhfCmd.parse(raw);
       if (frame != null) {
         _processFrame(frame);
       } else {
-        _addLog('SYS', '⚠ Frame con checksum inválido');
+        _addLog('SYS', '⚠ Frame con checksum inválido — descartado');
       }
     }
   }
@@ -494,16 +505,38 @@ class _UhcRfidReaderScanPageState extends State<UhcRfidReaderScanPage> {
   // ═════════════════════════════════════════════════════════════════════════
 
   void _processFrame(_UhfFrame f) {
-    // ── Notificación de inventario ───────────────────────────────────────
+    // ── LOG DE DEPURACIÓN — ver todo lo que llega parseado ────────────────
+    _addLog(
+      'SYS',
+      '🔍 Frame parseado → type=0x${f.type.toRadixString(16).padLeft(2, '0')} '
+          'cmd=0x${f.cmd.toRadixString(16).padLeft(2, '0')} '
+          'pl=${f.payload.length}B '
+          '${f.isNotification
+              ? "[NOTIF]"
+              : f.isResponse
+              ? "[RESP]"
+              : "[?]"} '
+          '${f.isInventory
+              ? "[INV]"
+              : f.isReadData
+              ? "[READ]"
+              : f.isError
+              ? "[ERR]"
+              : ""}',
+    );
+
+    // ── Notificación de inventario (type=0x02, cmd=0x22 o 0x27) ──────────
     if (f.isNotification && f.isInventory) {
       final tag = UhfTag.fromInventory(f);
-      if (tag == null) return;
+      if (tag == null) {
+        _addLog('SYS', '⚠ No se pudo parsear tag del frame de inventario');
+        return;
+      }
 
       setState(() {
         _allTags.insert(0, tag);
         if (_unique.containsKey(tag.epc)) {
           _unique[tag.epc]!.readCount++;
-          _unique[tag.epc]!.tid = _unique[tag.epc]!.tid; // preservar TID previo
         } else {
           _unique[tag.epc] = tag;
         }
@@ -512,6 +545,25 @@ class _UhcRfidReaderScanPageState extends State<UhcRfidReaderScanPage> {
       _addLog('SYS', '📦 EPC: ${tag.epc}  RSSI: ${tag.rssi} dBm');
       _autoScroll();
       return;
+    }
+
+    // ── Respuesta exitosa de inventario (type=0x01, cmd=0x22) ────────────
+    // Algunos lectores responden con type=0x01 cmd=0x22 con el tag data
+    if (f.isResponse && f.isInventory && f.payload.length >= 6) {
+      final tag = UhfTag.fromInventory(f);
+      if (tag != null) {
+        setState(() {
+          _allTags.insert(0, tag);
+          if (_unique.containsKey(tag.epc)) {
+            _unique[tag.epc]!.readCount++;
+          } else {
+            _unique[tag.epc] = tag;
+          }
+        });
+        _addLog('SYS', '📦 EPC (resp): ${tag.epc}  RSSI: ${tag.rssi} dBm');
+        _autoScroll();
+        return;
+      }
     }
 
     // ── Respuesta Read Data ──────────────────────────────────────────────
@@ -528,13 +580,15 @@ class _UhcRfidReaderScanPageState extends State<UhcRfidReaderScanPage> {
     if (f.isError) {
       final code = f.payload.isNotEmpty ? f.payload[0] : 0;
       final msg = code == 0x15
-          ? 'Sin tag / CRC error'
+          ? 'Sin tag en rango / CRC error'
+          : code == 0x09
+          ? 'Comando no soportado'
           : 'Error 0x${code.toRadixString(16).toUpperCase()}';
       _addLog('SYS', '⚠ $msg');
       return;
     }
 
-    // ── Fin de inventario múltiple ───────────────────────────────────────
+    // ── Fin de inventario múltiple (type=0x01, cmd=0x27) ─────────────────
     if (f.isResponse && f.cmd == 0x27) {
       _addLog(
         'SYS',
@@ -543,11 +597,11 @@ class _UhcRfidReaderScanPageState extends State<UhcRfidReaderScanPage> {
       return;
     }
 
-    // ── Otras respuestas ─────────────────────────────────────────────────
-    _addLog(
-      'SYS',
-      'Frame: type=0x${f.type.toRadixString(16)} cmd=0x${f.cmd.toRadixString(16)} pl=${f.payload.length}B',
-    );
+    // ── Respuesta de stop (type=0x01, cmd=0x28) ─────────────────────────
+    if (f.isResponse && f.cmd == 0x28) {
+      _addLog('SYS', 'Inventario detenido ✓');
+      return;
+    }
   }
 
   // ═════════════════════════════════════════════════════════════════════════
@@ -556,6 +610,10 @@ class _UhcRfidReaderScanPageState extends State<UhcRfidReaderScanPage> {
 
   Future<void> _startInventory() async {
     _rxBuf.clear();
+    // Primero intentar un single inventory para verificar comunicación
+    await _send(UhfCmd.singleInventory, 'Test single inventory (cmd 0x22)');
+    await Future.delayed(const Duration(milliseconds: 500));
+    // Luego iniciar inventario continuo
     await _send(
       UhfCmd.startInventory(),
       'Iniciar inventario continuo (cmd 0x27)',
