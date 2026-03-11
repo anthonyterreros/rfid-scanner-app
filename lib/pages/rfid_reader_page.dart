@@ -3,56 +3,45 @@ import 'dart:io';
 
 import 'package:excel/excel.dart' as xl;
 import 'package:flutter/material.dart';
-import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+
+import '../services/uhf_native_service.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Modelo de lectura RFID
+// Modelo local
 // ─────────────────────────────────────────────────────────────────────────────
 
 class RfidTag {
-  final String uid;
+  final String epc;
+  final String tid;
+  final String user;
+  final String rssi;
   final DateTime timestamp;
-  final int rssi;
-  final String raw;
 
   RfidTag({
-    required this.uid,
-    required this.timestamp,
+    required this.epc,
+    required this.tid,
+    required this.user,
     required this.rssi,
-    required this.raw,
+    required this.timestamp,
   });
 
-  static String bytesToHex(List<int> bytes) {
-    return bytes
-        .map((b) => b.toRadixString(16).padLeft(2, '0'))
-        .join(' ')
-        .toUpperCase();
-  }
+  String get uid => epc;
 
-  /// Temporal:
-  /// hasta confirmar el protocolo exacto del VH-C77P,
-  /// usamos el frame completo como UID bruto.
-  static RfidTag fromRawFrame(List<int> bytes, int rssi) {
-    final raw = bytesToHex(bytes);
-    final uid = raw.replaceAll(' ', '');
-    return RfidTag(
-      uid: uid,
-      timestamp: DateTime.now(),
-      rssi: rssi,
-      raw: raw,
-    );
+  String get raw {
+    final parts = <String>[];
+    parts.add('EPC:$epc');
+    if (tid.isNotEmpty) parts.add('TID:$tid');
+    if (user.isNotEmpty) parts.add('USER:$user');
+    return parts.join(' | ');
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Modelo de log BLE
-// ─────────────────────────────────────────────────────────────────────────────
-
 class BleLogEntry {
   final DateTime timestamp;
-  final String direction; // RX, TX, SYS
+  final String direction;
   final String description;
   final String rawHex;
   final int byteCount;
@@ -80,53 +69,41 @@ class RfidReaderPage extends StatefulWidget {
 }
 
 class _RfidReaderPageState extends State<RfidReaderPage> {
-  // ─── State ───────────────────────────────────────────────────────────────
   final List<RfidTag> _tags = [];
   final Map<String, RfidTag> _uniqueTagsMap = {};
   final List<BleLogEntry> _logs = [];
   final ScrollController _scrollController = ScrollController();
 
+  final UhfNativeService _uhfService = UhfNativeService();
+
+  StreamSubscription<List<UhfNativeTag>>? _inventorySub;
+  StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
+
   bool _isListening = false;
   bool _isExporting = false;
   bool _isFabExpanded = false;
   bool _deviceConnected = true;
-  bool _bleReady = false;
+  bool _nativeReady = false;
 
-  int _currentRssi = 0;
-  int _rxFrameCount = 0;
-
-  BluetoothCharacteristic? _notifyCharacteristic;
-  BluetoothCharacteristic? _writeCharacteristic;
-
-  StreamSubscription<List<int>>? _notifySubscription;
-  StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
-
-  final List<int> _rxBuffer = [];
-
-  static const String _nusServiceUuid =
-      '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
-  static const String _nusWriteUuid =
-      '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
-  static const String _nusNotifyUuid =
-      '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
-
-  // ─── Lifecycle ───────────────────────────────────────────────────────────
   @override
   void initState() {
     super.initState();
     _watchConnection();
-    _discoverAndListen();
+    _initNativeLayer();
   }
 
   @override
   void dispose() {
-    _notifySubscription?.cancel();
+    _inventorySub?.cancel();
     _connectionSubscription?.cancel();
     _scrollController.dispose();
     super.dispose();
   }
 
-  // ─── Logging helper ──────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────────
+  // Logs
+  // ─────────────────────────────────────────────────────────────────────────
+
   void _addLog({
     required String direction,
     required String description,
@@ -149,7 +126,10 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
     });
   }
 
-  // ─── BLE connection watcher ──────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────────
+  // Conexión Bluetooth
+  // ─────────────────────────────────────────────────────────────────────────
+
   void _watchConnection() {
     _connectionSubscription = widget.device.connectionState.listen((state) {
       if (!mounted) return;
@@ -163,16 +143,16 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
       _addLog(
         direction: 'SYS',
         description:
-            connected ? 'Conexión establecida' : 'Dispositivo desconectado',
+            connected ? 'Conexión BLE establecida' : 'Dispositivo desconectado',
       );
 
       if (!connected) {
-        _notifySubscription?.cancel();
-        _notifySubscription = null;
+        _inventorySub?.cancel();
+        _inventorySub = null;
 
         setState(() {
           _isListening = false;
-          _bleReady = false;
+          _nativeReady = false;
         });
 
         _showSnack('Dispositivo desconectado', isError: true);
@@ -180,233 +160,239 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
     });
   }
 
-  // ─── Descubrimiento GATT con NUS fijo ────────────────────────────────────
-  Future<void> _discoverAndListen() async {
-    try {
-      _addLog(direction: 'TX', description: 'Descubriendo servicios GATT...');
-      final services = await widget.device.discoverServices();
+  // Future<void> _initNativeLayer() async {
+  //   try {
+  //     _addLog(
+  //       direction: 'SYS',
+  //       description: 'Inicializando capa nativa RFID...',
+  //     );
 
+  //     // Aquí no descubrimos servicios NUS.
+  //     // Solo damos por listo el bridge nativo.
+  //     setState(() => _nativeReady = true);
+
+  //     _addLog(
+  //       direction: 'SYS',
+  //       description: 'SDK nativo RFID listo ✓',
+  //     );
+
+  //     _showSnack('SDK nativo listo');
+  //   } catch (e) {
+  //     _addLog(
+  //       direction: 'SYS',
+  //       description: 'Error inicializando SDK nativo: $e',
+  //     );
+  //     _showSnack('Error inicializando SDK nativo: $e', isError: true);
+  //   }
+  // }
+
+
+  Future<void> _initNativeLayer() async {
+    try {
       _addLog(
-        direction: 'RX',
-        description: '${services.length} servicios descubiertos',
+        direction: 'SYS',
+        description: 'Conectando SDK nativo al lector...',
       );
 
-      BluetoothService? nusService;
+      final ok = await _uhfService.connectReader(widget.device.remoteId.str);
 
-      for (final svc in services) {
-        _addLog(
-          direction: 'RX',
-          description:
-              'Servicio: ${svc.uuid.toString().toUpperCase()} (${svc.characteristics.length} características)',
-        );
-
-        for (final chr in svc.characteristics) {
-          final props = <String>[];
-          if (chr.properties.read) props.add('READ');
-          if (chr.properties.write) props.add('WRITE');
-          if (chr.properties.writeWithoutResponse) props.add('WRITE_NR');
-          if (chr.properties.notify) props.add('NOTIFY');
-          if (chr.properties.indicate) props.add('INDICATE');
-
-          _addLog(
-            direction: 'RX',
-            description:
-                '  └─ Char: ${chr.uuid.toString().toUpperCase()} [${props.join(", ")}]',
-          );
-        }
-
-        if (svc.uuid.toString().toLowerCase() == _nusServiceUuid) {
-          nusService = svc;
-        }
-      }
-
-      if (nusService == null) {
+      if (!ok) {
+        setState(() => _nativeReady = false);
         _addLog(
           direction: 'SYS',
-          description: '⚠ No se encontró el servicio NUS',
+          description: 'El SDK nativo no logró conectarse al lector',
         );
-        _showSnack('Servicio NUS no encontrado', isError: true);
+        _showSnack('El SDK nativo no logró conectarse al lector', isError: true);
         return;
       }
 
-      BluetoothCharacteristic? notifyChar;
-      BluetoothCharacteristic? writeChar;
-
-      for (final chr in nusService.characteristics) {
-        final uuid = chr.uuid.toString().toLowerCase();
-
-        if (uuid == _nusNotifyUuid) {
-          notifyChar = chr;
-        } else if (uuid == _nusWriteUuid) {
-          writeChar = chr;
-        }
-      }
-
-      if (notifyChar == null) {
-        _addLog(
-          direction: 'SYS',
-          description: '⚠ No se encontró NUS notify',
-        );
-        _showSnack('NUS notify no encontrado', isError: true);
-        return;
-      }
-
-      if (writeChar == null) {
-        _addLog(
-          direction: 'SYS',
-          description: '⚠ No se encontró NUS write',
-        );
-        _showSnack('NUS write no encontrado', isError: true);
-        return;
-      }
-
-      _notifyCharacteristic = notifyChar;
-      _writeCharacteristic = writeChar;
-      _bleReady = true;
+      setState(() => _nativeReady = true);
 
       _addLog(
         direction: 'SYS',
-        description:
-            'NUS listo ✓ Notify=${_notifyCharacteristic!.uuid.toString().toUpperCase()} Write=${_writeCharacteristic!.uuid.toString().toUpperCase()}',
+        description: 'SDK nativo conectado al lector ✓',
       );
 
-      if (mounted) setState(() {});
-      _showSnack('NUS listo');
+      _showSnack('SDK nativo conectado');
     } catch (e) {
-      _addLog(direction: 'SYS', description: '✖ Error GATT: $e');
-      _showSnack('Error al descubrir servicios: $e', isError: true);
+      setState(() => _nativeReady = false);
+      _addLog(
+        direction: 'SYS',
+        description: 'Error conectando SDK nativo: $e',
+      );
+      _showSnack('Error conectando SDK nativo: $e', isError: true);
     }
   }
 
-  // ─── Enviar comando al lector ────────────────────────────────────────────
-  Future<void> sendCommand(List<int> bytes, {String label = 'Comando'}) async {
-    if (_writeCharacteristic == null) {
-      _addLog(
-        direction: 'SYS',
-        description: '⚠ No hay characteristic WRITE disponible',
-      );
+  // ─────────────────────────────────────────────────────────────────────────
+  // RFID nativo
+  // ─────────────────────────────────────────────────────────────────────────
+
+  Future<void> _startListening() async {
+    if (!_deviceConnected) {
+      _showSnack('El dispositivo BLE no está conectado', isError: true);
       return;
     }
 
-    try {
-      final hexStr = bytes
-          .map((b) => b.toRadixString(16).padLeft(2, '0'))
-          .join(' ')
-          .toUpperCase();
-
-      _addLog(
-        direction: 'TX',
-        description: '$label (${bytes.length} bytes)',
-        rawHex: hexStr,
-        byteCount: bytes.length,
-      );
-
-      await _writeCharacteristic!.write(
-        bytes,
-        withoutResponse: _writeCharacteristic!.properties.writeWithoutResponse,
-      );
-
-      _addLog(direction: 'SYS', description: '$label enviado ✓');
-    } catch (e) {
-      _addLog(direction: 'SYS', description: '✖ Error al enviar comando: $e');
-      _showSnack('Error al enviar comando: $e', isError: true);
-    }
-  }
-
-  // ─── Comandos de prueba ──────────────────────────────────────────────────
-  Future<void> _sendStartA0() async {
-    await sendCommand(
-      [0xA0, 0x03, 0x01, 0x00, 0xA4],
-      label: 'START A0',
-    );
-  }
-
-  Future<void> _sendStopA0() async {
-    await sendCommand(
-      [0xA0, 0x03, 0x01, 0x01, 0xA5],
-      label: 'STOP A0',
-    );
-  }
-
-  Future<void> _sendStartBB() async {
-    await sendCommand(
-      [0xBB, 0x00, 0x27, 0x00, 0x27, 0x7E],
-      label: 'START BB',
-    );
-  }
-
-  Future<void> _sendStopBB() async {
-    await sendCommand(
-      [0xBB, 0x00, 0x28, 0x00, 0x28, 0x7E],
-      label: 'STOP BB',
-    );
-  }
-
-  // ─── Inicio de escucha ───────────────────────────────────────────────────
-  Future<void> _startListening() async {
-    if (!_bleReady || _notifyCharacteristic == null) {
-      _showSnack('BLE/NUS aún no está listo', isError: true);
+    if (!_nativeReady) {
+      _showSnack('La capa nativa aún no está lista', isError: true);
       return;
     }
 
     if (_isListening) return;
 
     try {
-      _rxBuffer.clear();
-
       _addLog(
         direction: 'TX',
-        description:
-            'Activando NOTIFY en ${_notifyCharacteristic!.uuid.toString().toUpperCase()}',
+        description: 'Invocando startInventoryTag()',
       );
 
-      await _notifyCharacteristic!.setNotifyValue(true);
+      final ok = await _uhfService.startInventory();
 
-      _addLog(direction: 'SYS', description: 'Notificaciones NUS activadas ✓');
-
-      await _notifySubscription?.cancel();
-
-      _notifySubscription = _notifyCharacteristic!.onValueReceived.listen(
-        (bytes) {
-          if (bytes.isEmpty || !mounted) return;
-
-          _rxFrameCount++;
-
-          final hexStr = bytes
-              .map((b) => b.toRadixString(16).padLeft(2, '0'))
-              .join(' ')
-              .toUpperCase();
-
-          _addLog(
-            direction: 'RX',
-            description: 'Frame recibido #$_rxFrameCount (${bytes.length} bytes)',
-            rawHex: hexStr,
-            byteCount: bytes.length,
-          );
-
-          _handleIncomingBytes(bytes);
-        },
-        onError: (e) {
-          _addLog(direction: 'SYS', description: '✖ Error de lectura: $e');
-          _showSnack('Error de lectura: $e', isError: true);
-        },
-      );
-
-      if (mounted) {
-        setState(() => _isListening = true);
+      if (!ok) {
+        _addLog(
+          direction: 'SYS',
+          description: 'startInventoryTag() devolvió false',
+        );
+        _showSnack('No se pudo iniciar inventario', isError: true);
+        return;
       }
 
-      _showSnack('Escucha iniciada');
+      await _inventorySub?.cancel();
+      _inventorySub = _uhfService.inventoryStream().listen(
+        (nativeTags) {
+          if (!mounted) return;
+
+          for (final nt in nativeTags) {
+            if (nt.epc.trim().isEmpty) continue;
+
+            final tag = RfidTag(
+              epc: nt.epc.trim(),
+              tid: nt.tid.trim(),
+              user: nt.user.trim(),
+              rssi: nt.rssi.trim(),
+              timestamp: DateTime.now(),
+            );
+
+            _addUniqueTag(tag);
+          }
+        },
+        onError: (e) {
+          _addLog(
+            direction: 'SYS',
+            description: 'Error en stream nativo: $e',
+          );
+          _showSnack('Error en inventario: $e', isError: true);
+        },
+      );
+
+      setState(() => _isListening = true);
+
+      _addLog(
+        direction: 'SYS',
+        description: 'Inventario RFID iniciado',
+      );
+      _showSnack('Inventario iniciado');
     } catch (e) {
-      _addLog(direction: 'SYS', description: '✖ Error al activar NOTIFY: $e');
-      _showSnack('No se pudo activar notificaciones: $e', isError: true);
+      _addLog(
+        direction: 'SYS',
+        description: 'Error al iniciar inventario: $e',
+      );
+      _showSnack('Error al iniciar inventario: $e', isError: true);
     }
   }
 
-  void _handleIncomingBytes(List<int> bytes) {
-    final tag = RfidTag.fromRawFrame(bytes, _currentRssi);
-    _addUniqueTag(tag);
+  Future<void> _stopListening() async {
+    try {
+      await _inventorySub?.cancel();
+      _inventorySub = null;
+
+      final ok = await _uhfService.stopInventory();
+
+      setState(() => _isListening = false);
+
+      _addLog(
+        direction: 'SYS',
+        description: ok
+            ? 'Inventario RFID detenido'
+            : 'stopInventory() devolvió false',
+      );
+
+      _showSnack(
+        ok ? 'Inventario detenido' : 'No se pudo detener inventario',
+        isError: !ok,
+      );
+    } catch (e) {
+      _addLog(
+        direction: 'SYS',
+        description: 'Error al detener inventario: $e',
+      );
+      _showSnack('Error al detener inventario: $e', isError: true);
+    }
   }
+
+  // Future<void> _inventorySingle() async {
+  //   try {
+  //     final ok = await _uhfService.inventorySingle();
+  //     _addLog(
+  //       direction: 'TX',
+  //       description: 'inventorySingleTag() => $ok',
+  //     );
+
+  //     final tags = await _uhfService.readTagsOnce();
+  //     for (final nt in tags) {
+  //       if (nt.epc.trim().isEmpty) continue;
+
+  //       _addUniqueTag(
+  //         RfidTag(
+  //           epc: nt.epc.trim(),
+  //           tid: nt.tid.trim(),
+  //           user: nt.user.trim(),
+  //           rssi: nt.rssi.trim(),
+  //           timestamp: DateTime.now(),
+  //         ),
+  //       );
+  //     }
+
+  //     _showSnack(ok ? 'Lectura simple ejecutada' : 'No se leyó ninguna etiqueta');
+  //   } catch (e) {
+  //     _showSnack('Error en lectura simple: $e', isError: true);
+  //   }
+  // }
+
+  Future<void> _inventorySingle() async {
+    try {
+      final tags = await _uhfService.inventorySingle();
+
+      if (tags.isEmpty) {
+        _addLog(
+          direction: 'SYS',
+          description: 'inventorySingleTag() sin resultados',
+        );
+        _showSnack('No se leyó ninguna etiqueta');
+        return;
+      }
+
+      for (final nt in tags) {
+        if (nt.epc.trim().isEmpty) continue;
+
+        _addUniqueTag(
+          RfidTag(
+            epc: nt.epc.trim(),
+            tid: nt.tid.trim(),
+            user: nt.user.trim(),
+            rssi: nt.rssi.trim(),
+            timestamp: DateTime.now(),
+          ),
+        );
+      }
+
+      _showSnack('Lectura simple realizada');
+    } catch (e) {
+      _showSnack('Error en lectura simple: $e', isError: true);
+    }
+  }
+
 
   void _addUniqueTag(RfidTag tag) {
     final exists = _uniqueTagsMap.containsKey(tag.uid);
@@ -426,36 +412,18 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
     });
 
     _addLog(
-      direction: 'SYS',
-      description: 'Nuevo tag detectado: ${tag.uid}',
+      direction: 'RX',
+      description: 'Nuevo tag detectado: ${tag.epc}',
       rawHex: tag.raw,
-      byteCount: tag.raw.split(' ').length,
+      byteCount: 0,
     );
 
     _autoScroll();
   }
 
-  // ─── Detener escucha ─────────────────────────────────────────────────────
-  Future<void> _stopListening() async {
-    try {
-      await _notifySubscription?.cancel();
-      _notifySubscription = null;
-      _rxBuffer.clear();
-
-      if (_notifyCharacteristic != null) {
-        await _notifyCharacteristic!.setNotifyValue(false);
-      }
-
-      if (mounted) {
-        setState(() => _isListening = false);
-      }
-
-      _addLog(direction: 'SYS', description: 'Escucha detenida');
-    } catch (e) {
-      _addLog(direction: 'SYS', description: '✖ Error al detener escucha: $e');
-      _showSnack('No se pudo detener la escucha: $e', isError: true);
-    }
-  }
+  // ─────────────────────────────────────────────────────────────────────────
+  // UI helpers
+  // ─────────────────────────────────────────────────────────────────────────
 
   void _clearTags() {
     showDialog(
@@ -503,7 +471,6 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
     });
   }
 
-  // ─── Logs bottom sheet ───────────────────────────────────────────────────
   void _showLogsSheet() {
     setState(() => _isFabExpanded = false);
 
@@ -524,7 +491,6 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
     );
   }
 
-  // ─── Export to Excel ─────────────────────────────────────────────────────
   Future<void> _exportToExcel() async {
     setState(() => _isFabExpanded = false);
 
@@ -537,7 +503,6 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
 
     try {
       final excel = xl.Excel.createExcel();
-
       final xl.Sheet sheet = excel['Lecturas RFID'];
       excel.delete('Sheet1');
 
@@ -553,11 +518,12 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
 
       final headers = [
         '#',
-        'UID / Código',
+        'EPC',
+        'TID',
+        'USER',
         'Fecha',
         'Hora',
-        'RSSI (dBm)',
-        'Datos Crudos (HEX)',
+        'RSSI',
       ];
 
       for (int col = 0; col < headers.length; col++) {
@@ -572,25 +538,16 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
         final tag = _tags[i];
         final rowIdx = i + 1;
         final isEven = rowIdx % 2 == 0;
-        final baseStyle = isEven ? evenRowStyle : oddRowStyle;
-
-        final baseMonoStyle = isEven
-            ? xl.CellStyle(
-                fontFamily: 'Courier New',
-                backgroundColorHex: xl.ExcelColor.fromHexString('#EEF3FB'),
-              )
-            : xl.CellStyle(
-                fontFamily: 'Courier New',
-                backgroundColorHex: xl.ExcelColor.white,
-              );
+        final style = isEven ? evenRowStyle : oddRowStyle;
 
         final rowData = [
           xl.IntCellValue(_tags.length - i),
-          xl.TextCellValue(tag.uid),
+          xl.TextCellValue(tag.epc),
+          xl.TextCellValue(tag.tid),
+          xl.TextCellValue(tag.user),
           xl.TextCellValue(_formatDate(tag.timestamp)),
           xl.TextCellValue(_formatTime(tag.timestamp)),
-          xl.IntCellValue(tag.rssi),
-          xl.TextCellValue(tag.raw),
+          xl.TextCellValue(tag.rssi),
         ];
 
         for (int col = 0; col < rowData.length; col++) {
@@ -598,33 +555,17 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
             xl.CellIndex.indexByColumnRow(columnIndex: col, rowIndex: rowIdx),
           );
           cell.value = rowData[col];
-          cell.cellStyle = col == 5 ? baseMonoStyle : baseStyle;
+          cell.cellStyle = style;
         }
       }
 
-      final summaryRow = _tags.length + 2;
-
-      sheet
-          .cell(
-            xl.CellIndex.indexByColumnRow(columnIndex: 0, rowIndex: summaryRow),
-          )
-          .value = xl.TextCellValue('Total de lecturas:');
-
-      sheet
-          .cell(
-            xl.CellIndex.indexByColumnRow(columnIndex: 1, rowIndex: summaryRow),
-          )
-          .value = xl.TextCellValue('=COUNTA(B2:B${_tags.length + 1})');
-
       sheet.setColumnWidth(0, 6);
-      sheet.setColumnWidth(1, 26);
-      sheet.setColumnWidth(2, 14);
-      sheet.setColumnWidth(3, 12);
+      sheet.setColumnWidth(1, 28);
+      sheet.setColumnWidth(2, 24);
+      sheet.setColumnWidth(3, 24);
       sheet.setColumnWidth(4, 14);
-      sheet.setColumnWidth(5, 52);
-
-      final xl.Sheet summary = excel['Resumen'];
-      _buildSummarySheet(summary);
+      sheet.setColumnWidth(5, 12);
+      sheet.setColumnWidth(6, 12);
 
       final bytes = excel.encode();
       if (bytes == null) {
@@ -650,77 +591,10 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
     } catch (e) {
       _showSnack('Error al exportar: $e', isError: true);
     } finally {
-      if (mounted) {
-        setState(() => _isExporting = false);
-      }
+      if (mounted) setState(() => _isExporting = false);
     }
   }
 
-  void _buildSummarySheet(xl.Sheet sheet) {
-    final Map<String, int> counts = {};
-    for (final tag in _tags) {
-      counts[tag.uid] = (counts[tag.uid] ?? 0) + 1;
-    }
-
-    final sorted = counts.entries.toList()
-      ..sort((a, b) => b.value.compareTo(a.value));
-
-    final h1 = xl.CellStyle(
-      bold: true,
-      fontFamily: xl.getFontFamily(xl.FontFamily.Arial),
-      backgroundColorHex: xl.ExcelColor.fromHexString('#1154B4'),
-      fontColorHex: xl.ExcelColor.white,
-    );
-
-    sheet.cell(xl.CellIndex.indexByColumnRow(columnIndex: 0, rowIndex: 0))
-      ..value = xl.TextCellValue('UID')
-      ..cellStyle = h1;
-
-    sheet.cell(xl.CellIndex.indexByColumnRow(columnIndex: 1, rowIndex: 0))
-      ..value = xl.TextCellValue('Lecturas')
-      ..cellStyle = h1;
-
-    sheet.cell(xl.CellIndex.indexByColumnRow(columnIndex: 2, rowIndex: 0))
-      ..value = xl.TextCellValue('Primera lectura')
-      ..cellStyle = h1;
-
-    sheet.cell(xl.CellIndex.indexByColumnRow(columnIndex: 3, rowIndex: 0))
-      ..value = xl.TextCellValue('Última lectura')
-      ..cellStyle = h1;
-
-    for (int i = 0; i < sorted.length; i++) {
-      final uid = sorted[i].key;
-      final tagsForUid = _tags.where((t) => t.uid == uid).toList()
-        ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
-
-      sheet
-          .cell(xl.CellIndex.indexByColumnRow(columnIndex: 0, rowIndex: i + 1))
-          .value = xl.TextCellValue(uid);
-
-      sheet
-          .cell(xl.CellIndex.indexByColumnRow(columnIndex: 1, rowIndex: i + 1))
-          .value = xl.IntCellValue(sorted[i].value);
-
-      sheet
-          .cell(xl.CellIndex.indexByColumnRow(columnIndex: 2, rowIndex: i + 1))
-          .value = xl.TextCellValue(
-        '${_formatDate(tagsForUid.first.timestamp)} ${_formatTime(tagsForUid.first.timestamp)}',
-      );
-
-      sheet
-          .cell(xl.CellIndex.indexByColumnRow(columnIndex: 3, rowIndex: i + 1))
-          .value = xl.TextCellValue(
-        '${_formatDate(tagsForUid.last.timestamp)} ${_formatTime(tagsForUid.last.timestamp)}',
-      );
-    }
-
-    sheet.setColumnWidth(0, 28);
-    sheet.setColumnWidth(1, 12);
-    sheet.setColumnWidth(2, 20);
-    sheet.setColumnWidth(3, 20);
-  }
-
-  // ─── Helpers ─────────────────────────────────────────────────────────────
   String _formatDate(DateTime dt) =>
       '${dt.day.toString().padLeft(2, '0')}/${dt.month.toString().padLeft(2, '0')}/${dt.year}';
 
@@ -737,8 +611,9 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
           content: Text(msg),
           backgroundColor: isError ? _C.error : _C.success,
           behavior: SnackBarBehavior.floating,
-          shape:
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(10),
+          ),
           duration: Duration(seconds: isError ? 4 : 2),
         ),
       );
@@ -748,7 +623,6 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
       ? widget.device.platformName
       : widget.device.remoteId.str;
 
-  // ─── Build ───────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
@@ -803,29 +677,14 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
             onPressed: _clearTags,
           ),
         IconButton(
-          icon: const Icon(Icons.playlist_play, color: Colors.white),
-          tooltip: 'START A0',
-          onPressed: (_deviceConnected && _bleReady) ? _sendStartA0 : null,
-        ),
-        IconButton(
-          icon: const Icon(Icons.stop_circle_outlined, color: Colors.white),
-          tooltip: 'STOP A0',
-          onPressed: (_deviceConnected && _bleReady) ? _sendStopA0 : null,
-        ),
-        IconButton(
-          icon: const Icon(Icons.send, color: Colors.white),
-          tooltip: 'START BB',
-          onPressed: (_deviceConnected && _bleReady) ? _sendStartBB : null,
-        ),
-        IconButton(
-          icon: const Icon(Icons.pause_circle_outline, color: Colors.white),
-          tooltip: 'STOP BB',
-          onPressed: (_deviceConnected && _bleReady) ? _sendStopBB : null,
+          icon: const Icon(Icons.filter_1, color: Colors.white),
+          tooltip: 'Lectura simple',
+          onPressed: (_deviceConnected && _nativeReady) ? _inventorySingle : null,
         ),
         Padding(
           padding: const EdgeInsets.only(right: 8),
           child: TextButton.icon(
-            onPressed: (_deviceConnected && _bleReady)
+            onPressed: (_deviceConnected && _nativeReady)
                 ? (_isListening ? _stopListening : _startListening)
                 : null,
             icon: Icon(
@@ -847,7 +706,7 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
               ),
             ),
             label: Text(
-              _isListening ? 'Pausar' : 'Escuchar',
+              _isListening ? 'Detener' : 'Iniciar',
               style: TextStyle(
                 color: _isListening ? _C.warning : _C.success,
                 fontSize: 13,
@@ -883,8 +742,7 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
             width: 48,
             height: 48,
             decoration: BoxDecoration(
-              color:
-                  (_deviceConnected ? _C.accent : _C.error).withOpacity(0.15),
+              color: (_deviceConnected ? _C.accent : _C.error).withOpacity(0.15),
               shape: BoxShape.circle,
             ),
             child: Icon(
@@ -943,9 +801,9 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  _bleReady ? 'NUS listo' : 'NUS no listo',
+                  _nativeReady ? 'SDK nativo listo' : 'SDK nativo no listo',
                   style: TextStyle(
-                    color: _bleReady ? _C.success : _C.warning,
+                    color: _nativeReady ? _C.success : _C.warning,
                     fontSize: 11,
                     fontWeight: FontWeight.w600,
                   ),
@@ -1047,7 +905,7 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
             Text(
               _isListening
                   ? 'Acerca una etiqueta RFID al lector'
-                  : 'Presiona "Escuchar" para comenzar',
+                  : 'Presiona "Iniciar" para comenzar',
               textAlign: TextAlign.center,
               style: TextStyle(
                 color: _C.textSecondary,
@@ -1110,38 +968,46 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Row(
-                    children: [
-                      Icon(Icons.nfc, size: 13, color: _C.accent),
-                      const SizedBox(width: 5),
-                      Expanded(
-                        child: Text(
-                          tag.uid,
-                          style: TextStyle(
-                            color: _C.textPrimary,
-                            fontSize: 14,
-                            fontWeight: FontWeight.w700,
-                            fontFamily: 'monospace',
-                            letterSpacing: 0.5,
-                          ),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                    ],
+                  Text(
+                    'EPC: ${tag.epc}',
+                    style: TextStyle(
+                      color: _C.textPrimary,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700,
+                      fontFamily: 'monospace',
+                    ),
                   ),
+                  if (tag.tid.isNotEmpty) ...[
+                    const SizedBox(height: 3),
+                    Text(
+                      'TID: ${tag.tid}',
+                      style: TextStyle(
+                        color: _C.textSecondary,
+                        fontSize: 10,
+                        fontFamily: 'monospace',
+                      ),
+                    ),
+                  ],
+                  if (tag.user.isNotEmpty) ...[
+                    const SizedBox(height: 3),
+                    Text(
+                      'USER: ${tag.user}',
+                      style: TextStyle(
+                        color: _C.textSecondary,
+                        fontSize: 10,
+                        fontFamily: 'monospace',
+                      ),
+                    ),
+                  ],
                   const SizedBox(height: 4),
                   Text(
-                    tag.raw,
+                    'RSSI: ${tag.rssi}',
                     style: TextStyle(
                       color: _C.textSecondary,
                       fontSize: 10,
-                      fontFamily: 'monospace',
                     ),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
                   ),
-                  const SizedBox(height: 5),
+                  const SizedBox(height: 4),
                   Row(
                     children: [
                       Icon(
@@ -1151,7 +1017,7 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
                       ),
                       const SizedBox(width: 4),
                       Text(
-                        '${_formatDate(tag.timestamp)}  ${_formatTime(tag.timestamp)}',
+                        '${_formatDate(tag.timestamp)} ${_formatTime(tag.timestamp)}',
                         style: TextStyle(
                           color: _C.textSecondary,
                           fontSize: 11,
@@ -1164,8 +1030,7 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
             ),
             if (isNew)
               Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
                 decoration: BoxDecoration(
                   color: _C.success.withOpacity(0.15),
                   borderRadius: BorderRadius.circular(6),
@@ -1186,7 +1051,6 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
     );
   }
 
-  // ─── Expandable FAB ─────────────────────────────────────────────────────
   Widget _buildExpandableFAB() {
     return Column(
       mainAxisSize: MainAxisSize.min,
@@ -1247,10 +1111,6 @@ class _RfidReaderPageState extends State<RfidReaderPage> {
     );
   }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// FAB option mini-button
-// ─────────────────────────────────────────────────────────────────────────────
 
 class _FabOption extends StatelessWidget {
   final IconData icon;
@@ -1318,10 +1178,6 @@ class _FabOption extends StatelessWidget {
     );
   }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// BLE Logs Bottom Sheet
-// ─────────────────────────────────────────────────────────────────────────────
 
 class _BleLogsSheet extends StatefulWidget {
   final List<BleLogEntry> logs;
@@ -1415,7 +1271,7 @@ class _BleLogsSheetState extends State<_BleLogsSheet> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'Logs BLE',
+                        'Logs RFID',
                         style: TextStyle(
                           color: _C.textPrimary,
                           fontSize: 16,
@@ -1424,7 +1280,10 @@ class _BleLogsSheetState extends State<_BleLogsSheet> {
                       ),
                       Text(
                         '${widget.logs.length} entradas • ${filtered.length} visibles',
-                        style: TextStyle(color: _C.textSecondary, fontSize: 11),
+                        style: TextStyle(
+                          color: _C.textSecondary,
+                          fontSize: 11,
+                        ),
                       ),
                     ],
                   ),
@@ -1566,17 +1425,6 @@ class _BleLogsSheetState extends State<_BleLogsSheet> {
                     fontFamily: 'monospace',
                   ),
                 ),
-                if (entry.byteCount > 0) ...[
-                  const SizedBox(width: 8),
-                  Text(
-                    '${entry.byteCount}B',
-                    style: TextStyle(
-                      color: _C.textSecondary.withOpacity(0.6),
-                      fontSize: 9,
-                      fontFamily: 'monospace',
-                    ),
-                  ),
-                ],
               ],
             ),
             const SizedBox(height: 4),
@@ -1615,10 +1463,6 @@ class _BleLogsSheetState extends State<_BleLogsSheet> {
     );
   }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Log filter chip
-// ─────────────────────────────────────────────────────────────────────────────
 
 class _LogFilterChip extends StatelessWidget {
   final String label;
@@ -1660,10 +1504,6 @@ class _LogFilterChip extends StatelessWidget {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Estilos de celda reutilizables
-// ─────────────────────────────────────────────────────────────────────────────
-
 final headerStyle = xl.CellStyle(
   fontFamily: xl.getFontFamily(xl.FontFamily.Arial),
   bold: true,
@@ -1671,10 +1511,6 @@ final headerStyle = xl.CellStyle(
   backgroundColorHex: xl.ExcelColor.fromHexString('#1154B4'),
   horizontalAlign: xl.HorizontalAlign.Center,
 );
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Widgets auxiliares
-// ─────────────────────────────────────────────────────────────────────────────
 
 class _Divider extends StatelessWidget {
   const _Divider();
@@ -1786,10 +1622,6 @@ class _PulsingDotState extends State<_PulsingDot>
         ),
       );
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Paleta
-// ─────────────────────────────────────────────────────────────────────────────
 
 abstract class _C {
   static const bgAppBar = Color(0xFF2563EB);

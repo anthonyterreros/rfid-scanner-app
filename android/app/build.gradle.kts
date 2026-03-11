@@ -39,6 +39,10 @@ android {
     }
 }
 
+dependencies {
+    implementation(files("libs/deviceapi.jar"))
+}
+
 flutter {
     source = "../.."
 }
